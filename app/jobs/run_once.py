@@ -71,8 +71,22 @@ async def run_insolvency(lookback_hours: int = 2) -> dict:
     from app.adapters.insolvency import InsolvencyAdapter, FEDERAL_STATES
     from app.database import AsyncSessionLocal
     from app.models.job import Job
+    from app.models.source import Source
+    from app.pipeline.entity_resolution import PartyCache
     from playwright.async_api import async_playwright
+    from sqlalchemy import select
     import uuid
+
+    # Pre-fetch source ID and load party cache ONCE for the entire run.
+    # This eliminates a DB round-trip per item for both lookups.
+    insolvency_src_id: str | None = None
+    party_cache: PartyCache | None = None
+    async with AsyncSessionLocal() as db:
+        src_stmt = select(Source).where(Source.source_key == "insolvency_portal")
+        src = (await db.execute(src_stmt)).scalar_one_or_none()
+        if src:
+            insolvency_src_id = str(src.id)
+        party_cache = await PartyCache.load(db)
 
     windows = InsolvencyAdapter.build_discover_windows(
         states=FEDERAL_STATES,
@@ -146,7 +160,11 @@ async def run_insolvency(lookback_hours: int = 2) -> dict:
                                                 "hint": item.hint,
                                             },
                                         )
-                                        result = await _handle_fetch_inline(fetch_job, db)
+                                        result = await _handle_fetch_inline(
+                                            fetch_job, db,
+                                            src_id=insolvency_src_id,
+                                            party_cache=party_cache,
+                                        )
                                         if result.get("status") == "fetched":
                                             total_ingested += 1
                                 except Exception as exc:
@@ -271,8 +289,13 @@ async def run_purge() -> dict:
 
 # ── Inline fetch handler (avoids job table round-trip in Actions) ─────────────
 
-async def _handle_fetch_inline(job, db):
-    """Inline version of runner._handle_fetch — skips job table."""
+async def _handle_fetch_inline(job, db, src_id: str | None = None, party_cache=None):
+    """
+    Inline version of runner._handle_fetch — skips job table.
+
+    src_id: pre-fetched Source.id string (avoids per-item DB lookup).
+    party_cache: PartyCache instance for in-memory ER (avoids per-item table scan).
+    """
     from app.adapters import ADAPTER_REGISTRY
     from app.jobs.runner import _ingest_insolvency, _ingest_asset_lead
     import hashlib
@@ -296,21 +319,26 @@ async def _handle_fetch_inline(job, db):
     from app.models.raw_document import RawDocument
     from app.models.source import Source
     from sqlalchemy import select
+    import uuid as _uuid
 
-    src_stmt = select(Source).where(Source.source_key == source_key)
-    src = (await db.execute(src_stmt)).scalar_one_or_none()
-    if not src:
-        return {"status": "error", "reason": "source not found"}
+    # Use pre-fetched src_id if available, otherwise look it up
+    if src_id is None:
+        src_stmt = select(Source).where(Source.source_key == source_key)
+        src = (await db.execute(src_stmt)).scalar_one_or_none()
+        if not src:
+            return {"status": "error", "reason": "source not found"}
+        src_id = str(src.id)
+    src_uuid = _uuid.UUID(src_id)
 
     dup_stmt = select(RawDocument).where(
-        RawDocument.source_id == src.id,
+        RawDocument.source_id == src_uuid,
         RawDocument.fingerprint == fingerprint,
     )
     if (await db.execute(dup_stmt)).scalar_one_or_none():
         return {"status": "duplicate"}
 
     raw_doc = RawDocument(
-        source_id=src.id,
+        source_id=src_uuid,
         external_id=external_id,
         url=url,
         url_hash=hashlib.sha256(url.encode()).digest(),
@@ -324,7 +352,8 @@ async def _handle_fetch_inline(job, db):
     parsed_dict = dataclasses.asdict(parsed) if dataclasses.is_dataclass(parsed) else {}
 
     if source_key == "insolvency_portal":
-        return await _ingest_insolvency(db, parsed_dict, str(raw_doc.id))
+        return await _ingest_insolvency(db, parsed_dict, str(raw_doc.id),
+                                        src_id=src_id, party_cache=party_cache)
     else:
         return await _ingest_asset_lead(db, source_key, parsed_dict, str(raw_doc.id))
 

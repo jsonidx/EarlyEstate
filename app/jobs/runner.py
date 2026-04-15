@@ -210,7 +210,11 @@ async def _handle_parse(job: Job, db: AsyncSession) -> dict[str, Any]:
 
 
 async def _ingest_insolvency(
-    db: AsyncSession, data: dict, raw_doc_id: str | None
+    db: AsyncSession,
+    data: dict,
+    raw_doc_id: str | None,
+    src_id: str | None = None,
+    party_cache: "Any | None" = None,
 ) -> dict[str, Any]:
     from app.models.event import Event
     from app.models.source import Source
@@ -219,18 +223,25 @@ async def _ingest_insolvency(
     from app.models.party import PartyAddress
     from datetime import datetime
 
-    src_stmt = select(Source).where(Source.source_key == "insolvency_portal")
-    src = (await db.execute(src_stmt)).scalar_one_or_none()
-    if not src:
-        return {"status": "error", "reason": "source not found"}
+    # Allow callers to pass a cached src_id to avoid a DB lookup per item
+    if src_id is None:
+        src_stmt = select(Source).where(Source.source_key == "insolvency_portal")
+        src = (await db.execute(src_stmt)).scalar_one_or_none()
+        if not src:
+            return {"status": "error", "reason": "source not found"}
+        src_id = str(src.id)
+        src_uuid = src.id
+    else:
+        import uuid as _uuid
+        src_uuid = _uuid.UUID(src_id)
 
-    # Entity resolution
+    # Entity resolution — pass in-memory cache if available
     er_input = ERInput(
         name_raw=data.get("debtor_name", "Unknown"),
         party_type=_guess_party_type(data.get("debtor_name", "")),
-        source_id=str(src.id),
+        source_id=src_id,
     )
-    er_result = await resolve_party(db, er_input)
+    er_result = await resolve_party(db, er_input, cache=party_cache)
 
     # Geocode debtor seat — only for companies, not natural persons.
     # Natural persons in insolvency don't typically hold commercial real estate,
@@ -255,7 +266,7 @@ async def _ingest_insolvency(
     # Create event
     pub_date = data.get("publication_date")
     event = Event(
-        source_id=src.id,
+        source_id=src_uuid,
         event_type="INSOLVENCY_PUBLICATION",
         event_time=_parse_iso(pub_date),
         external_id=data.get("external_id"),
