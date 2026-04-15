@@ -1,0 +1,54 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: earlyestate
+      POSTGRES_PASSWORD: earlyestate
+      POSTGRES_DB: earlyestate
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U earlyestate"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://earlyestate:earlyestate@db:5432/earlyestate
+      DATABASE_URL_SYNC: postgresql://earlyestate:earlyestate@db:5432/earlyestate
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    working_dir: /app
+
+  worker:
+    build: .
+    command: python workers/worker.py
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://earlyestate:earlyestate@db:5432/earlyestate
+      DATABASE_URL_SYNC: postgresql://earlyestate:earlyestate@db:5432/earlyestate
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - .:/app
+      - playwright_cache:/root/.cache/ms-playwright
+    working_dir: /app
+
+volumes:
+  pg_data:
+  playwright_cache:
