@@ -165,7 +165,7 @@ async def run_insolvency(lookback_hours: int = 2) -> dict:
                                             src_id=insolvency_src_id,
                                             party_cache=party_cache,
                                         )
-                                        if result.get("status") == "fetched":
+                                        if result.get("status") == "ingested":
                                             total_ingested += 1
                                 except Exception as exc:
                                     logger.error("insolvency.item_error", error=str(exc))
@@ -353,7 +353,8 @@ async def _handle_fetch_inline(job, db, src_id: str | None = None, party_cache=N
 
     if source_key == "insolvency_portal":
         return await _ingest_insolvency(db, parsed_dict, str(raw_doc.id),
-                                        src_id=src_id, party_cache=party_cache)
+                                        src_id=src_id, party_cache=party_cache,
+                                        skip_enqueue=True)
     else:
         return await _ingest_asset_lead(db, source_key, parsed_dict, str(raw_doc.id))
 

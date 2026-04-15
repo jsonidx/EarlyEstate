@@ -215,6 +215,7 @@ async def _ingest_insolvency(
     raw_doc_id: str | None,
     src_id: str | None = None,
     party_cache: "Any | None" = None,
+    skip_enqueue: bool = False,
 ) -> dict[str, Any]:
     from app.models.event import Event
     from app.models.source import Source
@@ -286,14 +287,15 @@ async def _ingest_insolvency(
     db.add(event)
     await db.flush()
 
-    # Enqueue MATCH job for this party
-    from app.pipeline.scheduler import enqueue_job
-    await enqueue_job(
-        db,
-        job_type="MATCH",
-        source_key="insolvency_portal",
-        payload={"party_id": er_result.party_id},
-    )
+    # Enqueue MATCH job — skip during bulk GitHub Actions runs (match_alert step handles it)
+    if not skip_enqueue:
+        from app.pipeline.scheduler import enqueue_job
+        await enqueue_job(
+            db,
+            job_type="MATCH",
+            source_key="insolvency_portal",
+            payload={"party_id": er_result.party_id},
+        )
 
     return {
         "status": "ingested",
