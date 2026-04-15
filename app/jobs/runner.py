@@ -232,9 +232,12 @@ async def _ingest_insolvency(
     )
     er_result = await resolve_party(db, er_input)
 
-    # Geocode debtor seat if available
+    # Geocode debtor seat — only for companies, not natural persons.
+    # Natural persons in insolvency don't typically hold commercial real estate,
+    # and geocoding every consumer case would exhaust the Nominatim rate limit.
     seat_city = data.get("seat_city")
-    if seat_city and er_result.is_new:
+    party_type = er_input.party_type
+    if seat_city and er_result.is_new and party_type == "COMPANY":
         geo = await geocode_address(f"{seat_city}, Germany")
         if geo:
             addr = PartyAddress(
@@ -450,7 +453,7 @@ def _serialize_parsed(parsed: Any) -> dict:
 
 def _guess_party_type(name: str) -> str:
     """Heuristic: if name contains legal form suffix → COMPANY, else UNKNOWN."""
-    company_indicators = ["gmbh", "ag", " kg ", "ohg", "ug ", "gmbh &", "s.a.", "s.p.a."]
+    company_indicators = ["gmbh", " ag ", " ag)", " kg ", "ohg", " ug ", " ug)", "gmbh &", "s.a.", "s.p.a.", "e.k.", " se ", " se)"]
     name_lower = name.lower()
     for indicator in company_indicators:
         if indicator in name_lower:

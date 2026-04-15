@@ -303,7 +303,9 @@ class InsolvencyAdapter(ScrapeAdapter[InsolvencyDiscoverParams, InsolvencyDetail
             tos_reviewed=False,
             store_raw_payload="metadata_only",
             personal_data_level="medium",
-            rate_limit_rps=0.5,  # 1 request per 2 seconds
+            # fetch_detail() is a no-op for this adapter (data comes from discover() hint dict).
+            # Rate limiting is implicit in the Playwright browser session time (~5-10s per state).
+            rate_limit_rps=0.0,
             notes=[
                 "InsBekV § 3: delete personal data ≤6 months after insolvency procedure ends.",
                 "Portal rules: do not store result list URLs; search results are session-bound.",
