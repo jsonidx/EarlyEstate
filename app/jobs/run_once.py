@@ -60,14 +60,20 @@ async def run_seed() -> None:
 
 
 async def run_insolvency(lookback_hours: int = 2) -> dict:
-    """Discover + ingest insolvency publications for the last N hours."""
+    """
+    Discover + ingest insolvency publications for the last N hours.
+
+    Optimised for GitHub Actions:
+    - One Playwright browser shared across all 16 states (avoids 16× launch overhead).
+    - One DB session per state (avoids per-item connection setup cost).
+    - Geocode cache warms up across states (Berlin benefits from Bayern's cached cities).
+    """
     from app.adapters.insolvency import InsolvencyAdapter, FEDERAL_STATES
     from app.database import AsyncSessionLocal
-    from app.jobs.runner import _handle_discover, _handle_parse
     from app.models.job import Job
+    from playwright.async_api import async_playwright
     import uuid
 
-    adapter = InsolvencyAdapter(headless=True)
     windows = InsolvencyAdapter.build_discover_windows(
         states=FEDERAL_STATES,
         lookback_hours=lookback_hours,
@@ -78,42 +84,80 @@ async def run_insolvency(lookback_hours: int = 2) -> dict:
     total_ingested = 0
     errors = 0
 
-    for window in windows:
-        logger.info(
-            "insolvency.window",
-            state=window.state,
-            date_from=str(window.date_from),
-            date_to=str(window.date_to),
+    # Single browser for all 16 state searches
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (compatible; EarlyEstate/0.1; research use)",
+            locale="de-DE",
         )
-        try:
-            items = await adapter.discover(window)
-            total_discovered += len(items)
+        adapter = InsolvencyAdapter(headless=True)
 
-            for item in items:
+        for window in windows:
+            logger.info(
+                "insolvency.window",
+                state=window.state,
+                date_from=str(window.date_from),
+                date_to=str(window.date_to),
+            )
+            try:
+                # Reuse existing browser context — pass it into the adapter
+                page = await context.new_page()
+                page.set_default_timeout(30_000)
                 try:
+                    await adapter._fill_search_form(page, window)
+                    too_many, rows = await adapter._extract_result_rows(page)
+                    if too_many:
+                        logger.warning(
+                            "insolvency.too_many_results",
+                            state=window.state,
+                            date_from=str(window.date_from),
+                            date_to=str(window.date_to),
+                        )
+                    items = adapter._rows_to_discover_items(rows, window)
+                finally:
+                    await page.close()
+
+                total_discovered += len(items)
+                logger.info(
+                    "insolvency.discover",
+                    state=window.state,
+                    date_from=str(window.date_from),
+                    date_to=str(window.date_to),
+                    count=len(items),
+                )
+
+                # Single DB session per state — avoids per-item connection setup overhead.
+                # Each item gets its own SAVEPOINT so a bad item doesn't roll back
+                # the whole state's work.
+                if items:
                     async with AsyncSessionLocal() as db:
                         async with db.begin():
-                            # Build a synthetic FETCH job payload and run it inline
-                            fetch_job = Job(
-                                id=uuid.uuid4(),
-                                job_type="FETCH",
-                                source_key="insolvency_portal",
-                                payload={
-                                    "external_id": item.external_id,
-                                    "url": item.url,
-                                    "hint": item.hint,
-                                },
-                            )
-                            result = await _handle_fetch_inline(fetch_job, db)
-                            if result.get("status") == "fetched":
-                                total_ingested += 1
-                except Exception as exc:
-                    logger.error("insolvency.item_error", error=str(exc))
-                    errors += 1
+                            for item in items:
+                                try:
+                                    async with db.begin_nested():
+                                        fetch_job = Job(
+                                            id=uuid.uuid4(),
+                                            job_type="FETCH",
+                                            source_key="insolvency_portal",
+                                            payload={
+                                                "external_id": item.external_id,
+                                                "url": item.url,
+                                                "hint": item.hint,
+                                            },
+                                        )
+                                        result = await _handle_fetch_inline(fetch_job, db)
+                                        if result.get("status") == "fetched":
+                                            total_ingested += 1
+                                except Exception as exc:
+                                    logger.error("insolvency.item_error", error=str(exc))
+                                    errors += 1
 
-        except Exception as exc:
-            logger.error("insolvency.window_error", state=window.state, error=str(exc))
-            errors += 1
+            except Exception as exc:
+                logger.error("insolvency.window_error", state=window.state, error=str(exc))
+                errors += 1
+
+        await browser.close()
 
     return {
         "source": "insolvency_portal",
