@@ -12,8 +12,6 @@ Key constraints from the PRD:
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -27,15 +25,18 @@ from app.adapters.base import ComplianceMeta, DiscoverItem, ScrapeAdapter
 logger = structlog.get_logger(__name__)
 
 BASE_URL = "https://neu.insolvenzbekanntmachungen.de"
-SEARCH_PATH = "/ap/ext/0/result.jsf"
+SEARCH_PATH = "/ap/suche.jsf"
 
-# German federal states for sharding
+# German federal states with their portal option values (0-15)
 FEDERAL_STATES = [
     "Baden-Württemberg", "Bayern", "Berlin", "Brandenburg", "Bremen",
     "Hamburg", "Hessen", "Mecklenburg-Vorpommern", "Niedersachsen",
     "Nordrhein-Westfalen", "Rheinland-Pfalz", "Saarland", "Sachsen",
     "Sachsen-Anhalt", "Schleswig-Holstein", "Thüringen",
 ]
+
+# Map state name → select option value (0-indexed, matches portal dropdown)
+STATE_OPTION_VALUES: dict[str, str] = {s: str(i) for i, s in enumerate(FEDERAL_STATES)}
 
 
 @dataclass
@@ -52,9 +53,9 @@ class InsolvencyDetail:
     court: str              # Insolvenzgericht
     publication_subject: str
     seat_city: str | None
+    register_info: str | None
     publication_date: str
     source_url: str
-    raw_html_snippet: str   # Minimal — just the result row HTML
 
 
 @dataclass
@@ -67,6 +68,7 @@ class InsolvencyParsed:
     state: str | None
     publication_subject: str
     seat_city: str | None
+    register_info: str | None
     publication_date: datetime | None
     external_id: str  # stable: sha256(case_number_norm + court_norm)
 
@@ -75,7 +77,7 @@ class InsolvencyAdapter(ScrapeAdapter[InsolvencyDiscoverParams, InsolvencyDetail
     """
     Playwright-based scraper for insolvenzbekanntmachungen.de.
 
-    Discovery strategy: iterate over states × 30-min date windows.
+    Discovery strategy: iterate over states × date windows.
     The scheduler calls discover() once per trigger; it shards internally.
     """
 
@@ -104,9 +106,17 @@ class InsolvencyAdapter(ScrapeAdapter[InsolvencyDiscoverParams, InsolvencyDetail
             page.set_default_timeout(self.timeout_ms)
 
             try:
-                await self._navigate_to_search(page)
                 await self._fill_search_form(page, params)
-                rows = await self._extract_result_rows(page)
+                too_many, rows = await self._extract_result_rows(page)
+
+                if too_many:
+                    logger.warning(
+                        "insolvency.too_many_results",
+                        state=params.state,
+                        date_from=str(params.date_from),
+                        date_to=str(params.date_to),
+                    )
+
                 items = self._rows_to_discover_items(rows, params)
                 logger.info(
                     "insolvency.discover",
@@ -114,6 +124,7 @@ class InsolvencyAdapter(ScrapeAdapter[InsolvencyDiscoverParams, InsolvencyDetail
                     date_from=str(params.date_from),
                     date_to=str(params.date_to),
                     count=len(items),
+                    too_many=too_many,
                 )
             except Exception as exc:
                 logger.error("insolvency.discover.error", error=str(exc), state=params.state)
@@ -122,85 +133,87 @@ class InsolvencyAdapter(ScrapeAdapter[InsolvencyDiscoverParams, InsolvencyDetail
 
         return items
 
-    async def _navigate_to_search(self, page: Page) -> None:
-        await page.goto(BASE_URL, wait_until="networkidle")
-        # Accept cookies/session if a consent banner appears
+    async def _fill_search_form(self, page: Page, params: InsolvencyDiscoverParams) -> None:
+        """Navigate to the search form and submit with the given parameters."""
+        await page.goto(f"{BASE_URL}{SEARCH_PATH}", wait_until="networkidle")
+
+        # Accept cookie/session consent banner if present
         try:
             await page.click("button:has-text('Akzeptieren')", timeout=3_000)
         except Exception:
             pass
 
-    async def _fill_search_form(self, page: Page, params: InsolvencyDiscoverParams) -> None:
-        # Navigate to the search form
-        await page.goto(f"{BASE_URL}/ap/ext/0/index.jsf", wait_until="networkidle")
+        state_value = STATE_OPTION_VALUES.get(params.state, "")
+        if state_value:
+            # JSF colons in IDs must be escaped in CSS selectors
+            await page.select_option(
+                "select[name='frm_suche:lsom_bundesland:lsom']",
+                value=state_value,
+            )
 
-        # Select federal state
-        state_select = page.locator("select[name*='bundesland'], select[id*='bundesland']")
-        if await state_select.count() > 0:
-            await state_select.select_option(label=params.state)
+        # Date inputs are type="date" — use YYYY-MM-DD format
+        date_from_str = params.date_from.strftime("%Y-%m-%d")
+        date_to_str = params.date_to.strftime("%Y-%m-%d")
 
-        # Fill date range (dd.mm.yyyy format for German portal)
-        date_from_str = params.date_from.strftime("%d.%m.%Y")
-        date_to_str = params.date_to.strftime("%d.%m.%Y")
+        await page.fill(
+            "input[name='frm_suche:ldi_datumVon:datumHtml5']",
+            date_from_str,
+        )
+        await page.fill(
+            "input[name='frm_suche:ldi_datumBis:datumHtml5']",
+            date_to_str,
+        )
 
-        date_from_input = page.locator("input[name*='datumVon'], input[id*='datumVon']")
-        if await date_from_input.count() > 0:
-            await date_from_input.fill(date_from_str)
+        # Submit and wait for results to load
+        await page.click("input[name='frm_suche:cbt_suchen']")
+        await page.wait_for_load_state("networkidle")
 
-        date_to_input = page.locator("input[name*='datumBis'], input[id*='datumBis']")
-        if await date_to_input.count() > 0:
-            await date_to_input.fill(date_to_str)
+    async def _extract_result_rows(self, page: Page) -> tuple[bool, list[dict[str, str]]]:
+        """
+        Parse result table rows from the results page.
+        Returns (too_many_results, rows).
+        """
+        # Check for the "too many results" warning
+        too_many = False
+        overflow_el = page.locator("#otx_zuVieleTreffer")
+        if await overflow_el.count() > 0:
+            text = await overflow_el.inner_text()
+            if text.strip():
+                too_many = True
 
-        # Submit
-        submit_btn = page.locator("input[type='submit'], button[type='submit']")
-        if await submit_btn.count() > 0:
-            await submit_btn.first.click()
-            await page.wait_for_load_state("networkidle")
-
-    async def _extract_result_rows(self, page: Page) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []
-
-        # Result table rows — adapt selector to actual portal structure
-        result_rows = page.locator("table.result tr, tr.resultRow, tbody tr")
+        result_rows = page.locator("#tbl_ergebnis tbody tr")
         count = await result_rows.count()
 
         for i in range(count):
             row = result_rows.nth(i)
             cells = row.locator("td")
             cell_count = await cells.count()
-            if cell_count < 4:
+            if cell_count < 5:
                 continue
 
-            row_data: dict[str, str] = {}
-            texts = []
-            for j in range(cell_count):
-                texts.append((await cells.nth(j).inner_text()).strip())
+            # Extract text from each cell (column order is fixed in this portal)
+            pub_date = (await cells.nth(0).inner_text()).strip()
+            case_number = (await cells.nth(1).inner_text()).strip()
+            court = (await cells.nth(2).inner_text()).strip()
+            debtor_name = (await cells.nth(3).inner_text()).strip()
+            seat_city = (await cells.nth(4).inner_text()).strip()
+            register_info = (await cells.nth(5).inner_text()).strip() if cell_count > 5 else ""
 
-            # Column order from portal: date, court, case_number, debtor, subject
-            if len(texts) >= 5:
-                row_data = {
-                    "publication_date": texts[0],
-                    "court": texts[1],
-                    "case_number": texts[2],
-                    "debtor_name": texts[3],
-                    "publication_subject": texts[4],
-                    "seat_city": texts[5] if len(texts) > 5 else "",
-                }
-            elif len(texts) >= 4:
-                row_data = {
-                    "publication_date": texts[0],
-                    "court": texts[1],
-                    "case_number": texts[2],
-                    "debtor_name": texts[3],
-                    "publication_subject": "",
-                    "seat_city": "",
-                }
+            if not case_number:
+                continue
 
-            if row_data.get("case_number"):
-                row_data["raw_html"] = await row.inner_html()
-                rows.append(row_data)
+            rows.append({
+                "publication_date": pub_date,
+                "case_number": case_number,
+                "court": court,
+                "debtor_name": debtor_name,
+                "seat_city": seat_city,
+                "register_info": register_info,
+                "publication_subject": "",  # Available via detail popup only
+            })
 
-        return rows
+        return too_many, rows
 
     def _rows_to_discover_items(
         self, rows: list[dict[str, str]], params: InsolvencyDiscoverParams
@@ -222,8 +235,8 @@ class InsolvencyAdapter(ScrapeAdapter[InsolvencyDiscoverParams, InsolvencyDetail
                         "debtor_name": row.get("debtor_name", ""),
                         "publication_subject": row.get("publication_subject", ""),
                         "seat_city": row.get("seat_city", ""),
+                        "register_info": row.get("register_info", ""),
                         "publication_date": row.get("publication_date", ""),
-                        "raw_html": row.get("raw_html", ""),
                     },
                 )
             )
@@ -246,9 +259,9 @@ class InsolvencyAdapter(ScrapeAdapter[InsolvencyDiscoverParams, InsolvencyDetail
             court=hint.get("court", ""),
             publication_subject=hint.get("publication_subject", ""),
             seat_city=hint.get("seat_city") or None,
+            register_info=hint.get("register_info") or None,
             publication_date=hint.get("publication_date", ""),
             source_url=url,
-            raw_html_snippet=hint.get("raw_html", "")[:2000],  # Truncate — metadata only
         )
 
     # ── Parse ─────────────────────────────────────────────────────────────────
@@ -260,7 +273,6 @@ class InsolvencyAdapter(ScrapeAdapter[InsolvencyDiscoverParams, InsolvencyDetail
         pub_dt = self._parse_german_date(detail.publication_date)
         ext_id = self.sha256_hex(f"{case_norm}|{court_norm}")[:32]
 
-        # Derive state from court name heuristic
         state = self._infer_state_from_court(detail.court)
 
         return InsolvencyParsed(
@@ -272,6 +284,7 @@ class InsolvencyAdapter(ScrapeAdapter[InsolvencyDiscoverParams, InsolvencyDetail
             state=state,
             publication_subject=detail.publication_subject,
             seat_city=detail.seat_city,
+            register_info=detail.register_info,
             publication_date=pub_dt,
             external_id=ext_id,
         )
@@ -287,7 +300,7 @@ class InsolvencyAdapter(ScrapeAdapter[InsolvencyDiscoverParams, InsolvencyDetail
     def compliance_meta(self) -> ComplianceMeta:
         return ComplianceMeta(
             robots_respected=True,
-            tos_reviewed=False,  # Must be reviewed before production use
+            tos_reviewed=False,
             store_raw_payload="metadata_only",
             personal_data_level="medium",
             rate_limit_rps=0.5,  # 1 request per 2 seconds
@@ -358,21 +371,21 @@ class InsolvencyAdapter(ScrapeAdapter[InsolvencyDiscoverParams, InsolvencyDetail
     ) -> list[InsolvencyDiscoverParams]:
         """
         Generate (state, date_window) parameter pairs for the scheduler.
-        Shards time into window_minutes intervals to stay under the 1,000-hit cap.
+        For a 2h lookback, this generates one window per state covering today's date.
         """
         states = states or FEDERAL_STATES
         now = datetime.now(timezone.utc).replace(tzinfo=None)
+        today = now.date()
+        # For daily publication data, use today as both from and to date.
+        # Only extend back if lookback spans multiple calendar days.
+        date_from = (now - timedelta(hours=lookback_hours)).date()
         windows = []
-        t = now - timedelta(hours=lookback_hours)
-        while t < now:
-            t_end = min(t + timedelta(minutes=window_minutes), now)
-            for state in states:
-                windows.append(
-                    InsolvencyDiscoverParams(
-                        state=state,
-                        date_from=t.date(),
-                        date_to=t_end.date(),
-                    )
+        for state in states:
+            windows.append(
+                InsolvencyDiscoverParams(
+                    state=state,
+                    date_from=date_from,
+                    date_to=today,
                 )
-            t = t_end
+            )
         return windows

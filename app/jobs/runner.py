@@ -265,6 +265,7 @@ async def _ingest_insolvency(
             "state": data.get("state"),
             "publication_subject": data.get("publication_subject"),
             "seat_city": seat_city,
+            "register_info": data.get("register_info"),
         },
         confidence=0.9,
     )
