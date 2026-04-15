@@ -1,0 +1,30 @@
+name: Retention Purge
+
+on:
+  schedule:
+    # Weekly on Sunday at 03:00 UTC — InsBekV § 3 compliance
+    - cron: '0 3 * * 0'
+  workflow_dispatch: {}
+
+jobs:
+  purge:
+    name: Run InsBekV retention purge
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run retention purge
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_URL_SYNC: ${{ secrets.DATABASE_URL_SYNC }}
+        run: python -m app.jobs.run_once --job-type purge
