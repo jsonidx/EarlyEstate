@@ -1,5 +1,6 @@
 from typing import Literal, Optional
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,6 +29,13 @@ class Settings(BaseSettings):
     smtp_user: Optional[str] = None
     smtp_password: Optional[str] = None
     alert_from_email: str = "alerts@earlyestate.local"
+
+    @field_validator("smtp_port", mode="before")
+    @classmethod
+    def parse_smtp_port(cls, v: object) -> object:
+        if v == "" or v is None:
+            return 587
+        return v
 
     # ── Webhook ───────────────────────────────────────────────────────────────
     webhook_url: Optional[str] = None
