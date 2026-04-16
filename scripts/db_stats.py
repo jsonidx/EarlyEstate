@@ -23,7 +23,11 @@ queries = {
     "raw_documents":                    "SELECT COUNT(*) FROM raw_document",
     "asset_leads (bank portal)":        "SELECT COUNT(*) FROM asset_lead",
     "match_candidates":                 "SELECT COUNT(*) FROM match_candidate",
-    "alerts sent":                      "SELECT COUNT(*) FROM alert WHERE status='SENT'",
+    "alerts (SENT)":                    "SELECT COUNT(*) FROM alert WHERE status='SENT'",
+    "alerts (PENDING/DIGEST)":          "SELECT COUNT(*) FROM alert WHERE status!='SENT'",
+    "match HIGH (≥80)":                "SELECT COUNT(*) FROM match_candidate WHERE score_total>=80",
+    "match MEDIUM (50-79)":            "SELECT COUNT(*) FROM match_candidate WHERE score_total>=50 AND score_total<80",
+    "match LOW (20-49)":               "SELECT COUNT(*) FROM match_candidate WHERE score_total>=20 AND score_total<50",
 }
 
 print("\n=== EarlyEstate DB Stats ===\n")
