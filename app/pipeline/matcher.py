@@ -82,6 +82,7 @@ def score_match(
     name_score = min(name_score, 40.0)
 
     # 2. Geo distance score (0–30)
+    # Try PostGIS distance first; fall through to PLZ/city if unavailable.
     geo_distance_m: float | None = None
     geo_score = 0.0
     if party_address and party_address.geom is not None and asset_lead.geom is not None:
@@ -91,9 +92,10 @@ def score_match(
                 # Inverse linear: 0m → 30 pts, 50km → 0 pts
                 geo_score = 30.0 * (1.0 - geo_distance_m / MAX_GEO_DISTANCE_M)
         except Exception:
-            pass
-    elif party_address and party_address.postal_code and asset_lead.postal_code:
-        # Fallback: PLZ match
+            pass  # fall through to PLZ/city fallback below
+
+    # PLZ / city fallback — always applies when PostGIS score is still 0
+    if geo_score == 0.0 and party_address and party_address.postal_code and asset_lead.postal_code:
         if party_address.postal_code == asset_lead.postal_code:
             geo_score = 20.0
         elif party_address.city and asset_lead.city:
