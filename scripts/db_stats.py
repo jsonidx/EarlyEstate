@@ -47,6 +47,25 @@ cur.execute("""
 for row in cur.fetchall():
     print(f"  {(row[0] or 'unknown'):<30} {row[1]:>8,}")
 
+# Top match candidates by score
+print("\n--- Top 10 match candidates ---")
+cur.execute("""
+    SELECT mc.score_total,
+           mc.score_breakdown->>'geo_score' as geo,
+           mc.score_breakdown->>'name_similarity' as name,
+           mc.score_breakdown->>'auction_signal_score' as auction,
+           p.name_raw, p.party_type,
+           al.city as lead_city, al.postal_code as lead_plz
+    FROM match_candidate mc
+    JOIN party p ON p.id = mc.party_id
+    JOIN asset_lead al ON al.id = mc.asset_lead_id
+    ORDER BY mc.score_total DESC
+    LIMIT 10
+""")
+for row in cur.fetchall():
+    print(f"  score={row[0]:.1f} (geo={row[1]}, name={row[2]}, auction={row[3]}) "
+          f"| {row[4][:40]} ({row[5]}) -> {row[6]} {row[7]}")
+
 # Date range
 print("\n--- Publication date range ---")
 cur.execute("""
