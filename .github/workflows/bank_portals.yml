@@ -39,7 +39,7 @@ jobs:
   match-and-alert:
     name: Match + alert after scrape
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     needs: [scrape-immowelt]
 
     steps:
