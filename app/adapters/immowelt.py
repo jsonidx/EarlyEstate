@@ -28,7 +28,7 @@ logger = structlog.get_logger(__name__)
 BASE_URL = "https://www.immowelt.de"
 
 # Property-type path segments for ZV search
-PROPERTY_TYPES = ["haeuser", "wohnungen", "grundstuecke", "gewerbe"]
+PROPERTY_TYPES = ["haeuser", "wohnungen", "grundstuecke"]
 
 # Map immowelt type slug → AssetLead object_type
 _TYPE_MAP = {
@@ -90,7 +90,10 @@ class ImmoweltAdapter(ScrapeAdapter[ImmoweltDiscoverParams, ImmoweltDetail, Immo
 
     source_key = "immowelt_zv"
 
-    # Headers that mimic a real browser visit
+    # Headers that mimic a real browser visit.
+    # NOTE: Accept-Encoding and Connection are intentionally omitted —
+    # httpx manages compression natively; setting Accept-Encoding explicitly
+    # can cause the server to return a shorter/different response.
     _HEADERS = {
         "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -99,9 +102,7 @@ class ImmoweltAdapter(ScrapeAdapter[ImmoweltDiscoverParams, ImmoweltDetail, Immo
         ),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
         "DNT": "1",
-        "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
     }
 
@@ -140,34 +141,41 @@ class ImmoweltAdapter(ScrapeAdapter[ImmoweltDiscoverParams, ImmoweltDetail, Immo
         return items
 
     def _extract_listing_stubs(self, html: str, prop_type: str) -> list[DiscoverItem]:
-        """Extract expose UUIDs and card-level data from search results HTML."""
+        """
+        Extract expose UUIDs and card-level data from search results HTML.
+
+        Immowelt SSR structure (verified 2026-04):
+        - Cards are delimited by data-testid="serp-core-classified-card-testid"
+        - Each card has <a href="https://www.immowelt.de/expose/{UUID}" title="{summary}">
+        - Title format: "{Type} zur Versteigerung - {City} - {Price} € - {details}"
+        - PLZ is present as a 5-digit number within the card HTML
+        """
         items: list[DiscoverItem] = []
         seen: set[str] = set()
 
-        # Each listing has an anchor with href="/expose/{UUID}"
-        expose_pattern = re.compile(
-            r'href="/expose/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"',
+        # Split HTML into individual cards
+        card_boundary = 'data-testid="serp-core-classified-card-testid"'
+        card_segments = html.split(card_boundary)
+
+        # Regex: absolute URL form used by Immowelt SSR
+        expose_re = re.compile(
+            r'href="https://www\.immowelt\.de/expose/'
+            r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"'
+            r'[^>]*title="([^"]*)"',
             re.IGNORECASE,
         )
 
-        # Find all unique UUIDs; also try to extract surrounding card text
-        # We split by expose link to keep card context
-        segments = expose_pattern.split(html)
-        # segments alternates: [before_first, uuid1, after_uuid1, uuid2, after_uuid2, ...]
-
-        i = 1  # start at first UUID
-        while i < len(segments):
-            listing_id = segments[i].lower()
+        for segment in card_segments[1:]:  # skip preamble before first card
+            m = expose_re.search(segment)
+            if not m:
+                continue
+            listing_id = m.group(1).lower()
             if listing_id in seen:
-                i += 2
                 continue
             seen.add(listing_id)
 
-            card_context = segments[i + 1] if i + 1 < len(segments) else ""
-            # Take a reasonable window of HTML around the card
-            card_snippet = card_context[:2000]
-
-            hint = self._parse_card_snippet(card_snippet, prop_type, listing_id)
+            title_raw = m.group(2)
+            hint = self._parse_card_title(title_raw, segment, prop_type, listing_id)
             items.append(
                 DiscoverItem(
                     external_id=listing_id,
@@ -175,70 +183,65 @@ class ImmoweltAdapter(ScrapeAdapter[ImmoweltDiscoverParams, ImmoweltDetail, Immo
                     hint=hint,
                 )
             )
-            i += 2
 
         return items
 
-    def _parse_card_snippet(
-        self, snippet: str, prop_type: str, listing_id: str
+    def _parse_card_title(
+        self,
+        title_raw: str,
+        card_html: str,
+        prop_type: str,
+        listing_id: str,
     ) -> dict[str, Any]:
-        """Extract structured fields from the HTML snippet following a listing link."""
-        # Strip tags for text extraction
-        text = re.sub(r"<[^>]+>", " ", snippet)
-        text = re.sub(r"\s+", " ", text).strip()
+        """
+        Parse structured fields from the card title attribute and surrounding HTML.
 
-        # PLZ: (12345) or standalone 5-digit block
-        plz_m = re.search(r"\((\d{5})\)", text)
-        if not plz_m:
-            plz_m = re.search(r"\b(\d{5})\b", text)
-        postal_code = plz_m.group(1) if plz_m else None
+        Title format (verified): "{Type} zur Versteigerung - {City} - {Price} € - {details}"
+        Example: "Doppelhaushälfte zur Versteigerung - Neukieritzsch - 200.000 € - 4 Zimmer, 84 m²"
+        """
+        # Split title by " - "
+        parts = [p.strip() for p in title_raw.split(" - ")]
 
-        # City: word(s) before the PLZ in parentheses, or after PLZ
-        city: str | None = None
-        city_m = re.search(r"([A-ZÄÖÜa-zäöüß][A-Za-zÄÖÜäöüß\s\-]{2,40})\s*\(\d{5}\)", text)
-        if city_m:
-            city = city_m.group(1).strip()
-        elif postal_code:
-            after_plz = re.search(rf"{postal_code}\s+([A-ZÄÖÜa-zäöüß][^\s,]{{2,40}})", text)
-            if after_plz:
-                city = after_plz.group(1).strip()
+        # Part 0: property type description ("Doppelhaushälfte zur Versteigerung")
+        title = parts[0] if parts else f"ZV-Objekt {listing_id[:8]}"
 
-        # Price: first EUR amount
+        # Part 1: city
+        city: str | None = parts[1] if len(parts) > 1 else None
+
+        # Part 2: price ("200.000 €")
         price: float | None = None
-        price_m = re.search(r"(\d[\d.]+)\s*€", text)
-        if price_m:
-            try:
-                price = float(price_m.group(1).replace(".", "").replace(",", "."))
-            except ValueError:
-                pass
+        if len(parts) > 2:
+            price_m = re.search(r"([\d.]+)\s*€", parts[2])
+            if price_m:
+                try:
+                    price = float(price_m.group(1).replace(".", "").replace(",", "."))
+                except ValueError:
+                    pass
 
-        # Title: first meaningful sentence / heading fragment
-        title_m = re.search(
-            r"((?:Einfamilienhaus|Doppelhaus|Reihenhaus|Mehrfamilienhaus|"
-            r"Eigentumswohnung|Wohnung|Grundstück|Gewerbe|Zwangsversteigerung)"
-            r"[^\n<]{0,120})",
-            text, re.IGNORECASE,
-        )
-        title = title_m.group(1).strip() if title_m else f"ZV-Listing {listing_id[:8]}"
+        # PLZ: look for 5-digit number in card HTML (outside of image URLs)
+        postal_code: str | None = None
+        plz_m = re.search(r'\b(\d{5})\b', card_html)
+        if plz_m:
+            postal_code = plz_m.group(1)
 
-        # Detect Verkehrswert in card text
-        vkw: float | None = None
-        vkw_m = re.search(r"verkehrswert[^\d]*(\d[\d.,]+)\s*€", text, re.IGNORECASE)
-        if vkw_m:
-            try:
-                vkw = float(vkw_m.group(1).replace(".", "").replace(",", "."))
-            except ValueError:
-                pass
-
-        # Address raw: city + PLZ combined if available
+        # Build address_raw
         if city and postal_code:
-            address_raw = f"{city} {postal_code}"
+            address_raw = f"{postal_code} {city}"
         elif city:
             address_raw = city
         elif postal_code:
             address_raw = postal_code
         else:
             address_raw = ""
+
+        # Detect Verkehrswert if present in card HTML
+        vkw: float | None = None
+        vkw_m = re.search(r"verkehrswert[^\d]*(\d[\d.,]+)\s*€", card_html, re.IGNORECASE)
+        if vkw_m:
+            try:
+                vkw = float(vkw_m.group(1).replace(".", "").replace(",", "."))
+            except ValueError:
+                pass
 
         return {
             "prop_type": prop_type,
