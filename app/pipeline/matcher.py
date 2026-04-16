@@ -155,8 +155,15 @@ async def run_matching_for_party(
     max_leads: int = 100,
 ) -> list[MatchCandidate]:
     """
-    Run matching for a single party against all unmatched asset leads.
+    Run matching for a single party against all asset leads.
     Persists MatchCandidate records for scores ≥ LOW_THRESHOLD.
+
+    Uses 3 queries per party regardless of how many leads exist:
+    1. Fetch party
+    2. Fetch party address
+    3. Fetch all leads
+    4. Fetch all existing candidates for this party (single bulk query)
+    Then does in-memory upsert — no per-candidate SELECT.
     """
     party = await db.get(Party, party_id)
     if not party:
@@ -168,29 +175,30 @@ async def run_matching_for_party(
     result = await db.execute(stmt)
     party_address = result.scalar_one_or_none()
 
-    # Load candidate asset leads (all active, no existing match)
+    # Load all asset leads
     stmt = select(AssetLead).limit(max_leads)
     result = await db.execute(stmt)
     leads = result.scalars().all()
 
+    # Preload all existing candidates for this party (one query, not N)
+    stmt = select(MatchCandidate).where(MatchCandidate.party_id == party_id)
+    result = await db.execute(stmt)
+    existing_by_lead: dict[uuid.UUID, MatchCandidate] = {
+        mc.asset_lead_id: mc for mc in result.scalars().all()
+    }
+
     candidates = []
+    now = datetime.now(timezone.utc)
     for lead in leads:
         breakdown = score_match(party, lead, party_address)
         if breakdown.total < LOW_THRESHOLD:
             continue
 
-        # Upsert match candidate
-        stmt = select(MatchCandidate).where(
-            MatchCandidate.party_id == party_id,
-            MatchCandidate.asset_lead_id == lead.id,
-        )
-        result = await db.execute(stmt)
-        existing = result.scalar_one_or_none()
-
+        existing = existing_by_lead.get(lead.id)
         if existing:
             existing.score_total = breakdown.total
             existing.score_breakdown = _breakdown_to_dict(breakdown)
-            existing.updated_at = datetime.now(timezone.utc)
+            existing.updated_at = now
             candidates.append(existing)
         else:
             mc = MatchCandidate(
