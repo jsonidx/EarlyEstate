@@ -303,28 +303,37 @@ async def _run_immowelt() -> dict:
 
 
 async def run_match_and_alert() -> dict:
-    """Run matching for all unmatched parties, then send alerts."""
+    """
+    Run matching for all parties, then send alerts.
+
+    Each party is committed in its own transaction so partial progress is
+    durable if the job is killed by a timeout.
+    """
     from app.database import AsyncSessionLocal
     from app.models.party import Party
     from app.pipeline.alerter import process_pending_alerts
     from app.pipeline.matcher import run_matching_for_party
     from sqlalchemy import select
+    import uuid as _uuid
 
     candidates_total = 0
     alerts_sent = 0
 
+    # Load all party IDs upfront in a short-lived session
     async with AsyncSessionLocal() as db:
-        async with db.begin():
-            stmt = select(Party).limit(500)
-            result = await db.execute(stmt)
-            parties = result.scalars().all()
+        stmt = select(Party.id).limit(500)
+        result = await db.execute(stmt)
+        party_ids: list[_uuid.UUID] = [row[0] for row in result.fetchall()]
 
-            for party in parties:
-                try:
-                    candidates = await run_matching_for_party(db, party.id)
+    # Match each party in its own committed transaction
+    for party_id in party_ids:
+        try:
+            async with AsyncSessionLocal() as db:
+                async with db.begin():
+                    candidates = await run_matching_for_party(db, party_id)
                     candidates_total += len(candidates)
-                except Exception as exc:
-                    logger.error("match.party_error", party_id=str(party.id), error=str(exc))
+        except Exception as exc:
+            logger.error("match.party_error", party_id=str(party_id), error=str(exc))
 
     async with AsyncSessionLocal() as db:
         async with db.begin():
