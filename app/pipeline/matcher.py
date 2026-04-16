@@ -95,10 +95,13 @@ def score_match(
             pass  # fall through to PLZ/city fallback below
 
     # PLZ / city fallback — always applies when PostGIS score is still 0
-    if geo_score == 0.0 and party_address and party_address.postal_code and asset_lead.postal_code:
-        if party_address.postal_code == asset_lead.postal_code:
-            geo_score = 20.0
-        elif party_address.city and asset_lead.city:
+    if geo_score == 0.0 and party_address:
+        # PLZ exact match (strongest fallback)
+        if party_address.postal_code and asset_lead.postal_code:
+            if party_address.postal_code == asset_lead.postal_code:
+                geo_score = 20.0
+        # City name match (party_address.city is always set; postal_code may be None)
+        if geo_score == 0.0 and party_address.city and asset_lead.city:
             if party_address.city.lower() == (asset_lead.city or "").lower():
                 geo_score = 15.0
 
