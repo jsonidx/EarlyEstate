@@ -31,6 +31,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.asset_lead import AssetLead
+from app.models.event import Event
 from app.models.match_candidate import MatchCandidate
 from app.models.party import Party, PartyAddress
 from app.pipeline.entity_resolution import normalize_name
@@ -53,6 +54,7 @@ class ScoreBreakdown:
     geo_score: float            # 0–30
     auction_signal_score: float  # 0–20
     register_id_match: float    # 0–10
+    court_jurisdiction_score: float  # 0–15 (bonus)
     source_trust_weight: float  # multiplier 0.5–1.0
     total: float
     bucket: str                 # HIGH | MEDIUM | LOW | BELOW_THRESHOLD
@@ -62,6 +64,7 @@ def score_match(
     party: Party,
     asset_lead: AssetLead,
     party_address: PartyAddress | None,
+    insolvency_court: str | None = None,
     source_trust: float = 1.0,
 ) -> ScoreBreakdown:
     """
@@ -115,8 +118,23 @@ def score_match(
         if party.register_id == asset_lead.payload["register_id"]:
             register_score = 10.0
 
+    # 5. Court jurisdiction cross-match (0–15 bonus)
+    # Insolvency court city matching lead city → strong geo signal even without address.
+    # German court names: "Amtsgericht München", "Insolvenzgericht Berlin", etc.
+    # We extract the last word (the city) and compare to asset_lead.city.
+    court_score = 0.0
+    if insolvency_court and asset_lead.city:
+        court_city = _extract_court_city(insolvency_court)
+        if court_city and court_city.lower() == (asset_lead.city or "").lower():
+            court_score = 15.0
+        elif court_city and asset_lead.city:
+            # Fuzzy fallback — "München" vs "Munich" or compound city names
+            sim = fuzz.token_sort_ratio(court_city.lower(), asset_lead.city.lower())
+            if sim >= 85:
+                court_score = 10.0
+
     # Apply source trust weight (0.5–1.0)
-    raw_total = name_score + geo_score + auction_score + register_score
+    raw_total = name_score + geo_score + auction_score + register_score + court_score
     total = raw_total * source_trust
 
     bucket = _score_bucket(total)
@@ -127,6 +145,7 @@ def score_match(
         geo_score=round(geo_score, 2),
         auction_signal_score=round(auction_score, 2),
         register_id_match=round(register_score, 2),
+        court_jurisdiction_score=round(court_score, 2),
         source_trust_weight=source_trust,
         total=round(total, 2),
         bucket=bucket,
@@ -143,6 +162,29 @@ def _score_bucket(total: float) -> str:
     return "BELOW_THRESHOLD"
 
 
+def _extract_court_city(court_name: str) -> str | None:
+    """
+    Extract the city portion from a German court name.
+
+    Examples:
+      "Amtsgericht München"     → "München"
+      "Insolvenzgericht Berlin" → "Berlin"
+      "AG Hamburg"              → "Hamburg"
+      "München"                 → "München"  (already just city)
+    """
+    if not court_name:
+        return None
+    parts = court_name.strip().split()
+    if len(parts) == 0:
+        return None
+    # Skip known prefix words: Amtsgericht, Insolvenzgericht, AG, IG
+    skip_prefixes = {"amtsgericht", "insolvenzgericht", "ag", "ig", "landgericht", "lg"}
+    for part in parts:
+        if part.lower() not in skip_prefixes:
+            return part
+    return parts[-1]
+
+
 def _haversine_distance(party_addr: PartyAddress, lead: AssetLead) -> float:
     """
     Approximate distance in metres between party address and asset lead.
@@ -157,17 +199,20 @@ def _haversine_distance(party_addr: PartyAddress, lead: AssetLead) -> float:
 async def run_matching_for_party(
     db: AsyncSession,
     party_id: uuid.UUID,
-    max_leads: int = 100,
+    preloaded_leads: list[AssetLead] | None = None,
 ) -> list[MatchCandidate]:
     """
     Run matching for a single party against all asset leads.
     Persists MatchCandidate records for scores ≥ LOW_THRESHOLD.
 
-    Uses 3 queries per party regardless of how many leads exist:
+    Pass preloaded_leads to avoid a per-party SELECT when matching many parties
+    in a loop — load the leads once externally and pass them in.
+
+    Uses 4 queries per party:
     1. Fetch party
     2. Fetch party address
-    3. Fetch all leads
-    4. Fetch all existing candidates for this party (single bulk query)
+    3. Fetch all existing candidates for this party (bulk)
+    4. Fetch most recent insolvency event (for court city)
     Then does in-memory upsert — no per-candidate SELECT.
     """
     party = await db.get(Party, party_id)
@@ -180,10 +225,13 @@ async def run_matching_for_party(
     result = await db.execute(stmt)
     party_address = result.scalar_one_or_none()
 
-    # Load all asset leads
-    stmt = select(AssetLead).limit(max_leads)
-    result = await db.execute(stmt)
-    leads = result.scalars().all()
+    # Load all asset leads — use preloaded set when available (bulk-run optimisation)
+    if preloaded_leads is not None:
+        leads = preloaded_leads
+    else:
+        stmt = select(AssetLead)
+        result = await db.execute(stmt)
+        leads = result.scalars().all()
 
     # Preload all existing candidates for this party (one query, not N)
     stmt = select(MatchCandidate).where(MatchCandidate.party_id == party_id)
@@ -192,10 +240,23 @@ async def run_matching_for_party(
         mc.asset_lead_id: mc for mc in result.scalars().all()
     }
 
+    # Load most recent insolvency event court name for this party (one query)
+    insolvency_court: str | None = None
+    stmt = (
+        select(Event)
+        .where(Event.party_id == party_id, Event.event_type == "INSOLVENCY_PUBLICATION")
+        .order_by(Event.event_time.desc())
+        .limit(1)
+    )
+    result = await db.execute(stmt)
+    event = result.scalar_one_or_none()
+    if event:
+        insolvency_court = event.payload.get("court")
+
     candidates = []
     now = datetime.now(timezone.utc)
     for lead in leads:
-        breakdown = score_match(party, lead, party_address)
+        breakdown = score_match(party, lead, party_address, insolvency_court=insolvency_court)
         if breakdown.total < LOW_THRESHOLD:
             continue
 
@@ -246,6 +307,7 @@ def _breakdown_to_dict(b: ScoreBreakdown) -> dict[str, Any]:
         "geo_score": b.geo_score,
         "auction_signal_score": b.auction_signal_score,
         "register_id_match": b.register_id_match,
+        "court_jurisdiction_score": b.court_jurisdiction_score,
         "source_trust_weight": b.source_trust_weight,
         "total": b.total,
         "bucket": b.bucket,

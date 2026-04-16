@@ -17,7 +17,9 @@ import structlog
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.asset_lead import AssetLead
 from app.models.event import Event
+from app.models.match_candidate import MatchCandidate
 from app.models.party import Party, PartyAddress, PartyAlias
 from app.models.raw_document import RawDocument
 from app.models.source import Source
@@ -103,6 +105,37 @@ async def run_retention_purge(db: AsyncSession) -> dict[str, int]:
     }
     logger.info("auditor.retention_purge", **stats)
     return stats
+
+
+async def expire_stale_matches(db: AsyncSession) -> int:
+    """
+    Mark OPEN match_candidates as EXPIRED when the associated lead's auction_date
+    has passed (with a 3-day grace period).
+
+    This prevents outdated auction opportunities from re-triggering alerts or
+    cluttering the manual review queue.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=3)
+
+    # Subquery: leads whose auction has already passed
+    expired_lead_ids = select(AssetLead.id).where(
+        AssetLead.auction_date.is_not(None),
+        AssetLead.auction_date < cutoff,
+    )
+
+    stmt = (
+        update(MatchCandidate)
+        .where(
+            MatchCandidate.status == "OPEN",
+            MatchCandidate.asset_lead_id.in_(expired_lead_ids),
+        )
+        .values(status="EXPIRED")
+        .execution_options(synchronize_session=False)
+    )
+    result = await db.execute(stmt)
+    count = result.rowcount
+    logger.info("auditor.stale_matches_expired", count=count)
+    return count
 
 
 async def log_job_metrics(

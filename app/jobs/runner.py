@@ -221,7 +221,7 @@ async def _ingest_insolvency(
     from app.models.source import Source
     from app.pipeline.entity_resolution import ERInput, resolve_party
     from app.pipeline.geocoder import geocode_address, result_to_wkt
-    from app.models.party import PartyAddress
+    from app.models.party import Party, PartyAddress
     from datetime import datetime
 
     # Allow callers to pass a cached src_id to avoid a DB lookup per item
@@ -249,10 +249,11 @@ async def _ingest_insolvency(
     # and geocoding every consumer case would exhaust the Nominatim rate limit.
     seat_city = data.get("seat_city")
     party_type = er_input.party_type
+    party_addr: PartyAddress | None = None
     if seat_city and er_result.is_new and party_type == "COMPANY":
         geo = await geocode_address(f"{seat_city}, Germany")
         if geo:
-            addr = PartyAddress(
+            party_addr = PartyAddress(
                 party_id=uuid.UUID(er_result.party_id),
                 address_raw=seat_city,
                 city=seat_city,
@@ -262,7 +263,49 @@ async def _ingest_insolvency(
                 geocode_confidence=geo.confidence,
                 google_place_id=geo.place_id,
             )
-            db.add(addr)
+            db.add(party_addr)
+
+    # North Data enrichment — only for new COMPANY parties when API key is set.
+    # Provides register ID, register court, and exact postal code (PLZ).
+    # PLZ fills the postal_code gap that geocoding alone cannot give us,
+    # enabling PLZ-level geo scoring in the matcher.
+    if er_result.is_new and party_type == "COMPANY":
+        from app.pipeline.enrichment import enrich_from_north_data
+        enriched = await enrich_from_north_data(er_result.canonical_name)
+        if enriched:
+            party_obj = await db.get(Party, uuid.UUID(er_result.party_id))
+            if party_obj:
+                if not party_obj.register_id and enriched.register_id:
+                    party_obj.register_id = enriched.register_id
+                    logger.info(
+                        "enrichment.register_id_set",
+                        party_id=er_result.party_id,
+                        register_id=enriched.register_id,
+                    )
+                if not party_obj.register_court and enriched.register_court:
+                    party_obj.register_court = enriched.register_court
+            # Apply PLZ to party address (overrides geocoder-only city entry)
+            if enriched.postal_code and party_addr is not None:
+                party_addr.postal_code = enriched.postal_code
+                if enriched.city:
+                    party_addr.city = enriched.city
+            elif enriched.postal_code:
+                # Address was not created above (e.g. seat_city missing) — create now
+                party_addr = PartyAddress(
+                    party_id=uuid.UUID(er_result.party_id),
+                    address_raw=enriched.address or enriched.city or "",
+                    city=enriched.city,
+                    postal_code=enriched.postal_code,
+                    country="DE",
+                    geocode_provider="northdata",
+                )
+                db.add(party_addr)
+            logger.info(
+                "enrichment.north_data.applied",
+                party_id=er_result.party_id,
+                postal_code=enriched.postal_code,
+                status=enriched.status,
+            )
 
     # Create event
     pub_date = data.get("publication_date")
@@ -322,9 +365,31 @@ async def _ingest_asset_lead(
     if not cues:
         return {"status": "skipped", "reason": "no auction signal terms"}
 
+    # Idempotency: if we've seen this listing_id before, update mutable fields and skip insert.
+    # Prevents unbounded table growth on repeated daily runs.
+    listing_id = data.get("listing_id")
+    if listing_id:
+        dup_stmt = select(AssetLead).where(
+            AssetLead.source_id == src.id,
+            AssetLead.listing_id == listing_id,
+        )
+        existing = (await db.execute(dup_stmt)).scalar_one_or_none()
+        if existing:
+            # Update fields that may change between scrape runs
+            existing.title = data.get("title") or existing.title
+            existing.asking_price_eur = data.get("asking_price_eur") or existing.asking_price_eur
+            existing.verkehrswert_eur = data.get("verkehrswert_eur") or existing.verkehrswert_eur
+            existing.auction_date = _parse_iso(data.get("auction_date")) or existing.auction_date
+            existing.auction_signal_terms = cues
+            existing.payload = data
+            await db.flush()
+            return {"status": "updated", "asset_lead_id": str(existing.id)}
+
     address_raw = data.get("address_raw", "")
     city = data.get("city", "")
+    postal_code = data.get("postal_code")
     geom_wkt = None
+    geo = None
 
     if address_raw:
         geo = await geocode_address(f"{address_raw}, Germany")
@@ -333,10 +398,10 @@ async def _ingest_asset_lead(
 
     lead = AssetLead(
         source_id=src.id,
-        listing_id=data.get("listing_id"),
+        listing_id=listing_id,
         title=data.get("title"),
         address_raw=address_raw,
-        postal_code=data.get("postal_code"),
+        postal_code=postal_code,
         city=city,
         geom=geom_wkt,
         object_type=data.get("object_type"),
@@ -350,6 +415,37 @@ async def _ingest_asset_lead(
     )
     db.add(lead)
     await db.flush()
+
+    # BORIS BRW valuation — fetch Bodenrichtwert when we have coordinates + PLZ.
+    # Gracefully skipped when geo is unavailable or no state adapter exists.
+    if geo and postal_code:
+        from app.models.asset_lead import Valuation
+        from app.pipeline.enrichment import fetch_boris_brw, plz_to_state_code
+        state_code = plz_to_state_code(postal_code)
+        if state_code:
+            brw = await fetch_boris_brw(lat=geo.lat, lon=geo.lon, state=state_code)
+            if brw:
+                valuation = Valuation(
+                    asset_lead_id=lead.id,
+                    provider=brw.provider,
+                    value_point_eur=brw.value_eur_per_m2,
+                    meta={
+                        "type": "bodenrichtwert",
+                        "value_eur_per_m2": brw.value_eur_per_m2,
+                        "reference_year": brw.reference_year,
+                        "zone_id": brw.zone_id,
+                        "license": brw.license,
+                        "state": state_code,
+                    },
+                )
+                db.add(valuation)
+                logger.info(
+                    "boris.valuation_stored",
+                    lead_id=str(lead.id),
+                    state=state_code,
+                    brw_eur_m2=brw.value_eur_per_m2,
+                )
+
     return {"status": "ingested", "asset_lead_id": str(lead.id)}
 
 

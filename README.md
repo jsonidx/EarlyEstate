@@ -9,10 +9,24 @@ Early-stage real estate distress screener for Germany. Surfaces distressed-asset
 ## How it works
 
 ```
-Insolvency portal (every 2h)  ──┐
-Sparkasse / LBS (daily)        ├─► Parse ► Entity Resolution ► Geocode ► Match ► Telegram alert
-ZVG portal (disabled*)         ──┘
+Insolvency portal (every 30 min)  ──┐
+Immowelt ZV listings (daily 07:00) ─┤─► Parse ► Entity Resolution ► Geocode ► Match ► Telegram alert
+ZVG portal (disabled*)             ──┘
 ```
+
+Scoring signals (0–100):
+
+| Signal | Points | Fires when |
+|---|---|---|
+| Name similarity | 0–40 | Party name fuzzy-matches listing title |
+| Geo distance | 0–30 | PostGIS distance (or 15 pts city match, 20 pts PLZ match) |
+| Auction signal terms | 0–20 | "zwangsversteigerung", "verkehrswert" etc. in listing |
+| Register ID match | 0–10 | HRB/HRA number exact match |
+| Court jurisdiction | 0–15 | Insolvency court city = ZV listing city |
+
+Score ≥ 80 → **HIGH** → instant Telegram alert  
+Score 50–79 → **MEDIUM** → instant Telegram alert  
+Score 20–49 → **LOW** → queued for daily digest  
 
 ---
 
@@ -58,12 +72,19 @@ Go to your repo → **Settings → Secrets and variables → Actions → New rep
 | `TELEGRAM_CHAT_ID` | Your chat ID from getUpdates |
 
 Optional (for email alerts):
+
 | Secret name | Value |
 |---|---|
 | `SMTP_HOST` | `smtp.gmail.com` |
 | `SMTP_PORT` | `587` |
 | `SMTP_USER` | your Gmail address |
 | `SMTP_PASSWORD` | [Gmail App Password](https://myaccount.google.com/apppasswords) |
+
+Optional (North Data enrichment — improves PLZ matching and register ID lookup):
+
+| Secret name | Value |
+|---|---|
+| `NORTH_DATA_API_KEY` | API key from northdata.de |
 
 ### 4. Run the DB migration
 
@@ -77,24 +98,35 @@ The workflows will now run automatically:
 
 | Workflow | Schedule | What it does |
 |---|---|---|
-| `insolvency.yml` | Every 2 hours | Scrapes insolvency portal for all 16 states |
-| `bank_portals.yml` | Daily 06:00 UTC | Scrapes Sparkasse + LBS for ZV listings |
-| `purge.yml` | Weekly Sunday 03:00 UTC | InsBekV § 3 retention purge |
+| `insolvency.yml` | Every 30 min (weekdays) | Scrapes insolvency portal for all 16 states |
+| `bank_portals.yml` | Daily 07:00 UTC | Scrapes Immowelt ZV listings + runs matcher |
+| `digest.yml` | Daily 08:00 UTC | Sends daily Telegram digest of top LOW matches |
+| `purge.yml` | Weekly Sunday 03:00 UTC | InsBekV § 3 retention purge + expire stale matches |
 
 You can also trigger any workflow manually via **Actions → [workflow] → Run workflow**.
 
 ---
 
-## Upgrade to 30-minute insolvency cadence (free)
+## API (optional)
 
-The default is every 2 hours to stay within the 2,000 free minutes/month limit for **private repos**.
+Deploy to Railway for a read-only review UI and status endpoint:
 
-To get 30-minute cadence for free:
-1. Make the repo public (Settings → Danger Zone → Change visibility)
-2. Edit `.github/workflows/insolvency.yml`, change the cron to `'*/30 * * * *'`
-3. Commit and push
+1. Create a new project at [railway.app](https://railway.app)
+2. Connect your GitHub repo
+3. Set environment variables: `DATABASE_URL`, and optionally `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+4. Railway auto-deploys on push
 
-GitHub Actions is **unlimited for public repos**. Your secrets remain private.
+Key endpoints:
+
+| Endpoint | Description |
+|---|---|
+| `GET /matches?status=OPEN&min_score=50` | List match candidates |
+| `GET /matches/{id}` | Full enriched match detail (party + event + lead) |
+| `PATCH /matches/{id}` | Update status (CONFIRMED / REJECTED) |
+| `GET /leads?city=München` | Browse ZV asset leads |
+| `GET /events?event_type=INSOLVENCY_PUBLICATION` | Browse insolvency events |
+| `GET /health` | Health check |
+| `GET /docs` | Interactive API docs (Swagger UI) |
 
 ---
 
@@ -106,23 +138,20 @@ cp .env.example .env
 # Edit .env with your Supabase connection strings
 
 # Install deps
-make install
+pip install -e ".[dev]"
 
 # Start local Postgres (alternative to Supabase)
-make up          # docker compose up -d db
+docker compose up -d db
 
 # Migrate + seed
-make migrate
-make seed
+alembic upgrade head
+python -m app.jobs.run_once --seed
 
 # Run API
-make dev
-
-# Run worker
-make worker
+uvicorn app.api.main:app --reload
 
 # Run tests
-make test
+pytest
 ```
 
 ---
@@ -131,7 +160,7 @@ make test
 
 ```
 app/
-├── adapters/       # Scraping adapters (insolvency, sparkasse, lbs, zvg*)
+├── adapters/       # Scraping adapters (insolvency portal, immowelt ZV, zvg*)
 ├── pipeline/       # ER, geocoder, enrichment, matcher, alerter, auditor
 ├── alerts/         # Telegram, email, webhook channels
 ├── api/            # FastAPI routes (sources, events, leads, matches, admin)
@@ -139,10 +168,12 @@ app/
 └── jobs/           # run_once.py (GHA entrypoint), runner.py, seed.py
 
 .github/workflows/
-├── insolvency.yml  # Every 2h
-├── bank_portals.yml # Daily
-├── purge.yml       # Weekly
-└── migrate.yml     # Manual only
+├── insolvency.yml    # Every 30 min weekdays / 2h weekends
+├── bank_portals.yml  # Daily 07:00 UTC (Immowelt ZV scrape + match)
+├── digest.yml        # Daily 08:00 UTC (Telegram digest)
+├── purge.yml         # Weekly (retention purge + stale match expiry)
+├── migrate.yml       # Manual only
+└── stats.yml         # Manual — prints DB row counts
 ```
 
 ## Compliance notes

@@ -45,7 +45,7 @@ async def process_pending_alerts(db: AsyncSession) -> int:
             MatchCandidate.score_total >= 20.0,  # LOW threshold
         )
         .order_by(MatchCandidate.score_total.desc())
-        .limit(100)
+        .limit(200)
     )
     result = await db.execute(stmt)
     candidates = result.scalars().all()
@@ -84,8 +84,10 @@ async def _dispatch_match_candidate(db: AsyncSession, mc: MatchCandidate) -> int
 
     dedup_key = build_dedup_key(mc.party_id, mc.asset_lead_id, bucket, event_time)
 
+    brw = await _fetch_bodenrichtwert(db, lead)
+
     # Build alert payload (explainability fields from PRD)
-    payload = _build_alert_payload(mc, party, lead, event)
+    payload = _build_alert_payload(mc, party, lead, event, bodenrichtwert_eur_m2=brw)
 
     sent = 0
 
@@ -162,11 +164,245 @@ async def _create_and_send_alert(
     return 1 if success else 0
 
 
+async def send_digest_alerts(db: AsyncSession, top_n: int = 10) -> int:
+    """Dispatch both Telegram and email digests. Returns total alerts marked SENT."""
+    sent = 0
+    sent += await _send_telegram_digest(db, top_n)
+    sent += await _send_email_digest(db, top_n)
+    return sent
+
+
+async def _send_telegram_digest(db: AsyncSession, top_n: int = 10) -> int:
+    """
+    Batch dispatch: group DIGEST-status alerts into a single Telegram message.
+
+    Selects the top N pending DIGEST alerts (by match score), renders one
+    grouped summary message, marks all as SENT, and returns the count sent.
+    Only fires on Telegram — digest summaries are not emailed individually.
+    """
+    if not settings.telegram_bot_token or not settings.telegram_chat_id:
+        logger.warning("digest.no_telegram_config")
+        return 0
+
+    stmt = (
+        select(Alert)
+        .where(
+            Alert.delivery_rule == "DIGEST",
+            Alert.status == "PENDING",
+            Alert.channel == "TELEGRAM",
+        )
+        .order_by(Alert.created_at.desc())
+        .limit(top_n)
+    )
+    result = await db.execute(stmt)
+    alerts: list[Alert] = result.scalars().all()
+
+    if not alerts:
+        logger.info("digest.nothing_to_send")
+        return 0
+
+    text = _format_digest_message(alerts)
+
+    try:
+        from telegram import Bot
+
+        bot = Bot(token=settings.telegram_bot_token)
+        if len(text) > 4000:
+            text = text[:4000] + "\n…"
+        await bot.send_message(
+            chat_id=settings.telegram_chat_id,
+            text=f"<pre>{text}</pre>",
+            parse_mode="HTML",
+        )
+        logger.info("digest.sent", count=len(alerts))
+    except Exception as exc:
+        logger.error("digest.send_error", error=str(exc))
+        return 0
+
+    now = datetime.now(timezone.utc)
+    for alert in alerts:
+        alert.status = "SENT"
+        alert.sent_at = now
+
+    return len(alerts)
+
+
+def _format_digest_message(alerts: list[Alert]) -> str:
+    """Render top-N digest alerts as a single grouped Telegram message."""
+    from app.alerts.base import format_score_badge
+
+    lines = [
+        f"EarlyEstate Daily Digest — {len(alerts)} match(es)",
+        "=" * 40,
+        "",
+    ]
+    for i, alert in enumerate(alerts, 1):
+        p = alert.payload
+        party = p.get("party", {})
+        lead = p.get("asset_lead", {})
+        event = p.get("insolvency_event", {})
+        score = p.get("score_total", 0)
+        features = p.get("features", {})
+
+        lines.append(f"#{i} {format_score_badge(score)} Score {score:.0f}/100")
+        lines.append(f"  Party : {party.get('canonical_name', '?')} ({party.get('party_type', '?')})")
+        lines.append(f"  Court : {event.get('court', '?')}")
+        lines.append(f"  Lead  : {lead.get('title', '?')}")
+        city_plz = " ".join(filter(None, [lead.get('postal_code'), lead.get('city')]))
+        if city_plz:
+            lines.append(f"  Loc   : {city_plz}")
+        if lead.get("verkehrswert_eur"):
+            lines.append(f"  Wert  : €{lead['verkehrswert_eur']:,.0f}")
+        if lead.get("auction_date"):
+            lines.append(f"  Termin: {lead['auction_date']}")
+        breakdown = (
+            f"name={features.get('name_similarity', 0):.0f} "
+            f"geo={features.get('geo_score', 0):.0f} "
+            f"auction={features.get('auction_signal_score', 0):.0f}"
+        )
+        lines.append(f"  Score : {breakdown}")
+        if lead.get("details_url"):
+            lines.append(f"  URL   : {lead['details_url']}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+async def _send_email_digest(db: AsyncSession, top_n: int = 10) -> int:
+    """
+    Send a grouped HTML email digest for the top N pending DIGEST email alerts.
+    Marks delivered alerts as SENT. Returns count sent.
+    """
+    if not (settings.smtp_user and settings.smtp_password):
+        return 0
+
+    stmt = (
+        select(Alert)
+        .where(
+            Alert.delivery_rule == "DIGEST",
+            Alert.status == "PENDING",
+            Alert.channel == "EMAIL",
+        )
+        .order_by(Alert.created_at.desc())
+        .limit(top_n)
+    )
+    result = await db.execute(stmt)
+    alerts: list[Alert] = result.scalars().all()
+
+    if not alerts:
+        return 0
+
+    subject = f"[EarlyEstate] Daily Digest — {len(alerts)} match(es)"
+    html_body = _render_digest_html(alerts)
+    plain_body = _format_digest_message(alerts)
+
+    try:
+        import aiosmtplib
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = settings.alert_from_email
+        msg["To"] = settings.smtp_user
+        msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+        await aiosmtplib.send(
+            msg,
+            hostname=settings.smtp_host,
+            port=settings.smtp_port,
+            username=settings.smtp_user,
+            password=settings.smtp_password,
+            start_tls=True,
+        )
+        logger.info("digest.email_sent", count=len(alerts))
+    except Exception as exc:
+        logger.error("digest.email_error", error=str(exc))
+        return 0
+
+    now = datetime.now(timezone.utc)
+    for alert in alerts:
+        alert.status = "SENT"
+        alert.sent_at = now
+
+    return len(alerts)
+
+
+def _render_digest_html(alerts: list[Alert]) -> str:
+    """Render top-N digest alerts as a single HTML email."""
+    from app.alerts.base import format_score_badge
+
+    rows = []
+    for i, alert in enumerate(alerts, 1):
+        p = alert.payload
+        party = p.get("party", {})
+        lead = p.get("asset_lead", {})
+        event = p.get("insolvency_event", {})
+        score = p.get("score_total", 0)
+        features = p.get("features", {})
+        badge = format_score_badge(score)
+        url = lead.get("details_url", "")
+        brw = lead.get("bodenrichtwert_eur_m2")
+
+        rows.append(f"""
+  <tr style="border-top:2px solid #333">
+    <td style="padding:8px 4px;vertical-align:top">{i}</td>
+    <td style="padding:8px 4px">
+      <b>{badge} Score {score:.0f}/100</b><br>
+      <b>Partei:</b> {party.get('canonical_name','?')} ({party.get('party_type','?')})<br>
+      <b>Gericht:</b> {event.get('court','?')}<br>
+      <b>Aktenzeichen:</b> {event.get('case_number','?')}<br>
+      <b>ZV-Objekt:</b> {lead.get('title','?')}<br>
+      <b>Ort:</b> {lead.get('postal_code','')} {lead.get('city','?')}<br>
+      {f"<b>Verkehrswert:</b> €{lead['verkehrswert_eur']:,.0f}<br>" if lead.get('verkehrswert_eur') else ''}
+      {f"<b>Bodenrichtwert:</b> €{brw:,.0f}/m² (BORIS)<br>" if brw else ''}
+      {f"<b>ZV-Termin:</b> {lead['auction_date']}<br>" if lead.get('auction_date') else ''}
+      <b>Score:</b> name={features.get('name_similarity',0):.0f}
+        geo={features.get('geo_score',0):.0f}
+        auction={features.get('auction_signal_score',0):.0f}
+        court={features.get('court_jurisdiction_score',0):.0f}<br>
+      {f'<a href="{url}">{url}</a>' if url else '—'}
+    </td>
+  </tr>""")
+
+    rows_html = "\n".join(rows)
+    return f"""<!DOCTYPE html>
+<html>
+<body style="font-family:monospace;max-width:800px;margin:0 auto;padding:20px">
+  <h2>EarlyEstate Daily Digest — {len(alerts)} match(es)</h2>
+  <table border="1" cellpadding="4" cellspacing="0" style="width:100%">
+    <thead><tr><th>#</th><th>Match</th></tr></thead>
+    <tbody>{rows_html}</tbody>
+  </table>
+  <hr>
+  <small>EarlyEstate — Distress Screener | Retention: 6 months (InsBekV §3)</small>
+</body>
+</html>"""
+
+
+async def _fetch_bodenrichtwert(db: AsyncSession, lead: AssetLead) -> float | None:
+    """Load the most recent BORIS BRW valuation for this lead, if available."""
+    from app.models.asset_lead import Valuation
+    stmt = (
+        select(Valuation)
+        .where(Valuation.asset_lead_id == lead.id)
+        .order_by(Valuation.created_at.desc())
+        .limit(1)
+    )
+    result = await db.execute(stmt)
+    val = result.scalar_one_or_none()
+    if val and val.meta.get("type") == "bodenrichtwert":
+        return val.meta.get("value_eur_per_m2")
+    return None
+
+
 def _build_alert_payload(
     mc: MatchCandidate,
     party: Party,
     lead: AssetLead,
     event: Event | None,
+    bodenrichtwert_eur_m2: float | None = None,
 ) -> dict[str, Any]:
     """Build the explainable alert payload (PRD spec)."""
     return {
@@ -195,6 +431,7 @@ def _build_alert_payload(
             "object_type": lead.object_type,
             "asking_price_eur": float(lead.asking_price_eur) if lead.asking_price_eur else None,
             "verkehrswert_eur": float(lead.verkehrswert_eur) if lead.verkehrswert_eur else None,
+            "bodenrichtwert_eur_m2": bodenrichtwert_eur_m2,
             "auction_date": lead.auction_date.isoformat() if lead.auction_date else None,
             "court": lead.court,
             "details_url": lead.details_url,

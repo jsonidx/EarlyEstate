@@ -45,6 +45,8 @@ def format_alert_text(payload: dict[str, Any]) -> str:
 
     if lead.get("verkehrswert_eur"):
         lines.append(f"Verkehrswert: €{lead['verkehrswert_eur']:,.0f}")
+    if lead.get("bodenrichtwert_eur_m2"):
+        lines.append(f"Bodenrichtwert: €{lead['bodenrichtwert_eur_m2']:,.0f}/m²  (BORIS)")
     if lead.get("auction_date"):
         lines.append(f"ZV Termin: {lead['auction_date']}")
     if lead.get("court"):
@@ -52,13 +54,15 @@ def format_alert_text(payload: dict[str, Any]) -> str:
     if lead.get("auction_signal_terms"):
         lines.append(f"Cues: {', '.join(lead['auction_signal_terms'])}")
 
-    lines += [
-        "",
-        f"Score breakdown: name={features.get('name_similarity', 0):.0f} "
-        f"geo={features.get('geo_score', 0):.0f} "
-        f"auction={features.get('auction_signal_score', 0):.0f} "
+    breakdown_parts = [
+        f"name={features.get('name_similarity', 0):.0f}",
+        f"geo={features.get('geo_score', 0):.0f}",
+        f"auction={features.get('auction_signal_score', 0):.0f}",
         f"register={features.get('register_id_match', 0):.0f}",
     ]
+    if features.get("court_jurisdiction_score", 0):
+        breakdown_parts.append(f"court={features['court_jurisdiction_score']:.0f}")
+    lines += ["", f"Score breakdown: {' '.join(breakdown_parts)}"]
 
     if lead.get("details_url"):
         lines.append(f"URL: {lead['details_url']}")

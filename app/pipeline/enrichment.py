@@ -35,6 +35,8 @@ class NorthDataCompany:
     register_id: str | None
     register_court: str | None
     address: str | None
+    postal_code: str | None   # 5-digit German PLZ, if returned
+    city: str | None
     status: str | None  # active / dissolved / insolvent
     publications: list[dict[str, Any]]
 
@@ -63,11 +65,13 @@ async def enrich_from_north_data(company_name: str) -> NorthDataCompany | None:
 
             register = company.get("register", {}) or {}
             address_parts = company.get("address", {}) or {}
+            postal_code = address_parts.get("postalCode") or None
+            city = address_parts.get("city") or None
             address_str = ", ".join(
                 filter(None, [
                     address_parts.get("street"),
-                    address_parts.get("city"),
-                    address_parts.get("postalCode"),
+                    city,
+                    postal_code,
                 ])
             )
 
@@ -76,6 +80,8 @@ async def enrich_from_north_data(company_name: str) -> NorthDataCompany | None:
                 register_id=register.get("id"),
                 register_court=register.get("courtName"),
                 address=address_str or None,
+                postal_code=postal_code,
+                city=city,
                 status=company.get("status"),
                 publications=company.get("publications", []),
             )
@@ -95,6 +101,43 @@ class BORISValuation:
     reference_year: int
     zone_id: str | None
     license: str
+
+
+def plz_to_state_code(plz: str) -> str | None:
+    """
+    Map a German postal code to its ISO 3166-2 state code.
+    Used to route BORIS/BRW requests to the correct state OGC API.
+    """
+    if not plz or not plz[:2].isdigit():
+        return None
+    p = int(plz[:2])
+    if p <= 4:   return "SN"
+    if p == 6:   return "ST"
+    if p <= 9:   return "TH"
+    if p <= 12:  return "BE"
+    if p <= 16:  return "BB"
+    if p <= 19:  return "MV"
+    if p <= 22:  return "HH"
+    if p <= 25:  return "SH"
+    if p <= 29:  return "NI"  # covers HB (28/29) — HB has no separate BORIS
+    if p <= 31:  return "NI"
+    if p <= 33:  return "NW"
+    if p <= 36:  return "HE"
+    if p <= 38:  return "NI"
+    if p == 39:  return "ST"
+    if p <= 48:  return "NW"
+    if p == 49:  return "NI"
+    if p <= 53:  return "NW"
+    if p <= 56:  return "RP"
+    if p <= 59:  return "NW"
+    if p <= 65:  return "HE"
+    if p == 66:  return "SL"
+    if p <= 69:  return "RP"
+    if p <= 79:  return "BW"
+    if p <= 87:  return "BY"
+    if p <= 89:  return "BW"
+    if p <= 97:  return "BY"
+    return "TH"  # 98–99
 
 
 async def fetch_boris_brw(lat: float, lon: float, state: str = "BB") -> BORISValuation | None:

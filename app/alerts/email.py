@@ -100,6 +100,7 @@ def _render_html(payload: dict[str, Any]) -> str:
     <tr><td><b>Address</b></td><td>{lead.get('address_raw', '?')}</td></tr>
     <tr><td><b>Type</b></td><td>{lead.get('object_type', '?')}</td></tr>
     <tr><td><b>Verkehrswert</b></td><td>€{lead.get('verkehrswert_eur') or '—'}</td></tr>
+    <tr><td><b>Bodenrichtwert</b></td><td>{f"€{lead['bodenrichtwert_eur_m2']:,.0f}/m² (BORIS)" if lead.get('bodenrichtwert_eur_m2') else '—'}</td></tr>
     <tr><td><b>ZV Termin</b></td><td>{lead.get('auction_date') or '—'}</td></tr>
     <tr><td><b>Court</b></td><td>{lead.get('court') or '—'}</td></tr>
     <tr><td><b>Cues</b></td><td>{', '.join(lead.get('auction_signal_terms') or [])}</td></tr>
@@ -112,6 +113,7 @@ def _render_html(payload: dict[str, Any]) -> str:
     <tr><td>Geo score</td><td>{features.get('geo_score', 0):.1f}/30</td></tr>
     <tr><td>Auction signals</td><td>{features.get('auction_signal_score', 0):.1f}/20</td></tr>
     <tr><td>Register match</td><td>{features.get('register_id_match', 0):.1f}/10</td></tr>
+    <tr><td>Court jurisdiction</td><td>{features.get('court_jurisdiction_score', 0):.1f}/15</td></tr>
     <tr><td><b>Total</b></td><td><b>{score:.1f}/100</b></td></tr>
   </table>
 

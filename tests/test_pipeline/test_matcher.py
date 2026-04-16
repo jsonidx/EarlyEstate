@@ -13,6 +13,7 @@ from app.pipeline.matcher import (
     LOW_THRESHOLD,
     MEDIUM_THRESHOLD,
     ScoreBreakdown,
+    _extract_court_city,
     _score_bucket,
     build_dedup_key,
     score_match,
@@ -144,6 +145,77 @@ def test_source_trust_weight_scales_total():
     b_full = score_match(party, lead, None, source_trust=1.0)
     b_half = score_match(party, lead, None, source_trust=0.5)
     assert b_half.total == pytest.approx(b_full.total * 0.5, rel=0.01)
+
+
+# ── Court jurisdiction scoring tests ─────────────────────────────────────────
+
+def test_extract_court_city_amtsgericht():
+    assert _extract_court_city("Amtsgericht München") == "München"
+
+
+def test_extract_court_city_ag_abbreviation():
+    assert _extract_court_city("AG Hamburg") == "Hamburg"
+
+
+def test_extract_court_city_insolvenzgericht():
+    assert _extract_court_city("Insolvenzgericht Berlin") == "Berlin"
+
+
+def test_extract_court_city_no_prefix():
+    assert _extract_court_city("München") == "München"
+
+
+def test_extract_court_city_empty():
+    assert _extract_court_city("") is None
+
+
+def test_court_jurisdiction_exact_match_adds_15_pts():
+    party = make_party("muster gmbh")
+    lead = make_lead(city="München", auction_terms=["zwangsversteigerung"])
+    without = score_match(party, lead, None)
+    with_court = score_match(party, lead, None, insolvency_court="Amtsgericht München")
+    assert with_court.court_jurisdiction_score == 15.0
+    assert with_court.total == pytest.approx(without.total + 15.0, rel=0.01)
+
+
+def test_court_jurisdiction_no_match_zero_pts():
+    party = make_party("muster gmbh")
+    lead = make_lead(city="Berlin", auction_terms=["zwangsversteigerung"])
+    b = score_match(party, lead, None, insolvency_court="Amtsgericht München")
+    assert b.court_jurisdiction_score == 0.0
+
+
+def test_court_jurisdiction_none_court_zero_pts():
+    party = make_party("muster gmbh")
+    lead = make_lead(city="München")
+    b = score_match(party, lead, None, insolvency_court=None)
+    assert b.court_jurisdiction_score == 0.0
+
+
+def test_court_jurisdiction_boosts_score():
+    """Court jurisdiction adds 15 pts; combined with geo + auction it approaches MEDIUM."""
+    party = make_party("immobilien verwaltung gmbh")
+    addr = make_address(city="Frankfurt")
+    lead = make_lead(
+        city="Frankfurt",
+        title="Haus zur Versteigerung - Frankfurt",
+        auction_terms=["zwangsversteigerung"],
+    )
+    without_court = score_match(party, lead, addr)
+    with_court = score_match(party, lead, addr, insolvency_court="Amtsgericht Frankfurt")
+    assert with_court.court_jurisdiction_score == 15.0
+    assert with_court.total == pytest.approx(without_court.total + 15.0, rel=0.01)
+
+
+def test_court_jurisdiction_pushes_to_medium_with_name_match():
+    """Company whose canonical name matches the city crosses MEDIUM with court + geo + auction."""
+    # "Frankfurt GmbH" normalises to "frankfurt", which token-sort-matches lead city "Frankfurt"
+    # → name=40, geo=15, auction=5, court=15 = 75 (HIGH)
+    party = make_party("Frankfurt GmbH")
+    addr = make_address(city="Frankfurt")
+    lead = make_lead(city="Frankfurt", auction_terms=["zwangsversteigerung"])
+    b = score_match(party, lead, addr, insolvency_court="Amtsgericht Frankfurt")
+    assert b.total >= MEDIUM_THRESHOLD, f"Expected ≥{MEDIUM_THRESHOLD}, got {b.total}"
 
 
 # ── Dedup key tests ───────────────────────────────────────────────────────────

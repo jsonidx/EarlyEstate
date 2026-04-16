@@ -1,0 +1,47 @@
+name: Backfill Party Addresses
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Max parties to geocode (Nominatim: ~100/2min at 1 req/s)'
+        default: '100'
+        required: false
+      dry_run:
+        description: 'Dry run (print only, no DB writes)'
+        default: 'false'
+        required: false
+
+# Geocodes COMPANY parties that have no PartyAddress.
+# Run once after initial data load or after bulk insolvency ingestion.
+# Nominatim rate limit: 1 req/s → 100 parties takes ~2 minutes.
+# For large backlogs, run multiple times with --limit 100.
+
+jobs:
+  backfill:
+    name: Geocode parties without addresses
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run backfill
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GEOCODING_PROVIDER: nominatim
+          NOMINATIM_USER_AGENT: EarlyEstate/0.1-GHA
+        run: |
+          ARGS="--limit ${{ github.event.inputs.limit || '100' }}"
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python scripts/backfill_addresses.py $ARGS

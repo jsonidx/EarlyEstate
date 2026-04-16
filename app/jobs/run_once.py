@@ -121,13 +121,55 @@ async def run_insolvency(lookback_hours: int = 2) -> dict:
                 try:
                     await adapter._fill_search_form(page, window)
                     too_many, rows = await adapter._extract_result_rows(page)
+
                     if too_many:
+                        # Portal returned partial results (cap hit). Retry with a
+                        # narrower window — today-only — to recover the most recent
+                        # publications. The earlier-date results are accepted as-is.
+                        from datetime import date as _date
+                        today = _date.today()
+                        if window.date_from < today:
+                            from app.adapters.insolvency import InsolvencyDiscoverParams
+                            narrow = InsolvencyDiscoverParams(
+                                state=window.state,
+                                date_from=today,
+                                date_to=today,
+                            )
+                            try:
+                                await adapter._fill_search_form(page, narrow)
+                                _, narrow_rows = await adapter._extract_result_rows(page)
+                                # Merge — deduplicate by external_id
+                                seen_ids = {adapter.sha256_hex(
+                                    f"{adapter._normalize_case_number(r['case_number'])}|"
+                                    f"{r['court'].lower().strip()}"
+                                )[:32] for r in rows}
+                                for r in narrow_rows:
+                                    eid = adapter.sha256_hex(
+                                        f"{adapter._normalize_case_number(r['case_number'])}|"
+                                        f"{r['court'].lower().strip()}"
+                                    )[:32]
+                                    if eid not in seen_ids:
+                                        rows.append(r)
+                                        seen_ids.add(eid)
+                                logger.info(
+                                    "insolvency.too_many_retry_ok",
+                                    state=window.state,
+                                    total_rows=len(rows),
+                                )
+                            except Exception as retry_exc:
+                                logger.warning(
+                                    "insolvency.too_many_retry_failed",
+                                    state=window.state,
+                                    error=str(retry_exc),
+                                )
                         logger.warning(
                             "insolvency.too_many_results",
                             state=window.state,
                             date_from=str(window.date_from),
                             date_to=str(window.date_to),
+                            partial_rows=len(rows),
                         )
+
                     items = adapter._rows_to_discover_items(rows, window)
                 finally:
                     await page.close()
@@ -310,6 +352,7 @@ async def run_match_and_alert() -> dict:
     durable if the job is killed by a timeout.
     """
     from app.database import AsyncSessionLocal
+    from app.models.asset_lead import AssetLead
     from app.models.party import Party
     from app.pipeline.alerter import process_pending_alerts
     from app.pipeline.matcher import run_matching_for_party
@@ -319,18 +362,29 @@ async def run_match_and_alert() -> dict:
     candidates_total = 0
     alerts_sent = 0
 
-    # Load all party IDs upfront in a short-lived session
+    # Load party IDs and all asset leads in short-lived sessions.
+    # Leads are loaded once and reused across all parties — eliminates N lead-SELECT queries.
     async with AsyncSessionLocal() as db:
-        stmt = select(Party.id).limit(500)
+        stmt = select(Party.id)
         result = await db.execute(stmt)
         party_ids: list[_uuid.UUID] = [row[0] for row in result.fetchall()]
+
+    async with AsyncSessionLocal() as db:
+        stmt = select(AssetLead)
+        result = await db.execute(stmt)
+        all_leads = list(result.scalars().all())
+    # Objects are now detached (session closed) but attribute-loaded — safe for read-only scoring
+
+    logger.info("match.loaded", parties=len(party_ids), leads=len(all_leads))
 
     # Match each party in its own committed transaction
     for party_id in party_ids:
         try:
             async with AsyncSessionLocal() as db:
                 async with db.begin():
-                    candidates = await run_matching_for_party(db, party_id)
+                    candidates = await run_matching_for_party(
+                        db, party_id, preloaded_leads=all_leads
+                    )
                     candidates_total += len(candidates)
         except Exception as exc:
             logger.error("match.party_error", party_id=str(party_id), error=str(exc))
@@ -342,13 +396,26 @@ async def run_match_and_alert() -> dict:
     return {"candidates": candidates_total, "alerts_sent": alerts_sent}
 
 
+async def run_digest() -> dict:
+    """Send the daily digest batch — top 10 pending DIGEST alerts as one Telegram message."""
+    from app.database import AsyncSessionLocal
+    from app.pipeline.alerter import send_digest_alerts
+
+    async with AsyncSessionLocal() as db:
+        async with db.begin():
+            sent = await send_digest_alerts(db)
+    return {"digest_sent": sent}
+
+
 async def run_purge() -> dict:
     from app.database import AsyncSessionLocal
-    from app.pipeline.auditor import run_retention_purge
+    from app.pipeline.auditor import expire_stale_matches, run_retention_purge
 
     async with AsyncSessionLocal() as db:
         async with db.begin():
             stats = await run_retention_purge(db)
+            expired = await expire_stale_matches(db)
+            stats["expired_matches"] = expired
     return stats
 
 
@@ -456,6 +523,9 @@ async def main(args: argparse.Namespace) -> int:
     elif args.job_type == "alert" or args.source == "match_alert":
         result = await run_match_and_alert()
 
+    elif args.job_type == "digest":
+        result = await run_digest()
+
     elif args.job_type == "purge":
         result = await run_purge()
 
@@ -475,7 +545,7 @@ if __name__ == "__main__":
                                  "sparkasse_immobilien", "lbs_immobilien", "match_alert"],
                         help="Source to scrape")
     parser.add_argument("--job-type", default=None,
-                        choices=["alert", "purge"],
+                        choices=["alert", "digest", "purge"],
                         help="Pipeline job type to run")
     parser.add_argument("--migrate", action="store_true",
                         help="Run DB migrations and exit")

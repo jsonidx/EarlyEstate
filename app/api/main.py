@@ -2,14 +2,38 @@
 
 from __future__ import annotations
 
+import os
+from contextlib import asynccontextmanager
+
 import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import admin, events, leads, matches, sources
-from app.pipeline.scheduler import build_scheduler
 
 logger = structlog.get_logger(__name__)
+
+_scheduler = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _scheduler
+    # Only start the APScheduler in-process when explicitly enabled.
+    # In production (Railway + GitHub Actions) the scheduler is not needed —
+    # GitHub Actions crons handle all pipeline runs.
+    if os.getenv("ENABLE_SCHEDULER", "").lower() in ("1", "true", "yes"):
+        from app.pipeline.scheduler import build_scheduler
+        _scheduler = build_scheduler()
+        _scheduler.start()
+        logger.info("api.startup", scheduler="started")
+    else:
+        logger.info("api.startup", scheduler="disabled")
+    yield
+    if _scheduler:
+        _scheduler.shutdown(wait=False)
+    logger.info("api.shutdown")
+
 
 app = FastAPI(
     title="EarlyEstate",
@@ -17,6 +41,7 @@ app = FastAPI(
     version="0.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -31,23 +56,6 @@ app.include_router(events.router, prefix="/events", tags=["events"])
 app.include_router(leads.router, prefix="/leads", tags=["leads"])
 app.include_router(matches.router, prefix="/matches", tags=["matches"])
 app.include_router(admin.router, prefix="/admin", tags=["admin"])
-
-_scheduler = None
-
-
-@app.on_event("startup")
-async def startup() -> None:
-    global _scheduler
-    _scheduler = build_scheduler()
-    _scheduler.start()
-    logger.info("api.startup", scheduler="started")
-
-
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    if _scheduler:
-        _scheduler.shutdown(wait=False)
-    logger.info("api.shutdown")
 
 
 @app.get("/health")

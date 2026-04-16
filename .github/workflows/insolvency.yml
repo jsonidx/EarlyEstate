@@ -57,6 +57,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEOCODING_PROVIDER: nominatim
           NOMINATIM_USER_AGENT: EarlyEstate/0.1-GHA
+          NORTH_DATA_API_KEY: ${{ secrets.NORTH_DATA_API_KEY }}
         run: |
           python -m app.jobs.run_once \
             --source insolvency_portal \

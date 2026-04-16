@@ -54,6 +54,7 @@ cur.execute("""
            mc.score_breakdown->>'geo_score' as geo,
            mc.score_breakdown->>'name_similarity' as name,
            mc.score_breakdown->>'auction_signal_score' as auction,
+           mc.score_breakdown->>'court_jurisdiction_score' as court,
            p.name_raw, p.party_type,
            al.city as lead_city, al.postal_code as lead_plz
     FROM match_candidate mc
@@ -63,8 +64,9 @@ cur.execute("""
     LIMIT 10
 """)
 for row in cur.fetchall():
-    print(f"  score={row[0]:.1f} (geo={row[1]}, name={row[2]}, auction={row[3]}) "
-          f"| {row[4][:40]} ({row[5]}) -> {row[6]} {row[7]}")
+    court_part = f" court={row[4]}" if row[4] and float(row[4]) > 0 else ""
+    print(f"  score={row[0]:.1f} (geo={row[1]}, name={row[2]}, auction={row[3]}{court_part}) "
+          f"| {row[5][:40]} ({row[6]}) -> {row[7]} {row[8]}")
 
 # Date range
 print("\n--- Publication date range ---")
