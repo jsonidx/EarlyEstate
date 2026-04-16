@@ -2,9 +2,9 @@ name: Insolvency Screener
 
 on:
   schedule:
-    # Every 2 hours — stays within GitHub free tier (2,000 min/month private repo)
-    # For 30-min cadence: change to '*/30 * * * *' and make repo public (unlimited)
-    - cron: '0 */2 * * *'
+    # Every 2 hours on weekends, every 30 min on weekdays (German courts publish Mon-Fri)
+    - cron: '*/30 * * * 1-5'
+    - cron: '0 */2 * * 0,6'
   workflow_dispatch:
     inputs:
       lookback_hours:
