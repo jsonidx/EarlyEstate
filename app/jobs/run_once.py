@@ -189,12 +189,13 @@ async def run_bank_portal(source_key: str, pages: int = 5) -> dict:
     """Discover + ingest bank portal listings."""
     from app.adapters import ADAPTER_REGISTRY
     from app.database import AsyncSessionLocal
-    from app.models.job import Job
-    import uuid
 
     if source_key not in ADAPTER_REGISTRY:
         logger.error("run_bank.unknown_source", source_key=source_key)
         return {"error": f"unknown source: {source_key}"}
+
+    if source_key == "immowelt_zv":
+        return await _run_immowelt()
 
     adapter = ADAPTER_REGISTRY[source_key]()
     total_discovered = 0
@@ -237,6 +238,61 @@ async def run_bank_portal(source_key: str, pages: int = 5) -> dict:
             logger.error("bank.page_error", source=source_key, page=page, error=str(exc))
             errors += 1
             break
+
+    return {
+        "source": source_key,
+        "discovered": total_discovered,
+        "ingested": total_ingested,
+        "errors": errors,
+    }
+
+
+async def _run_immowelt() -> dict:
+    """
+    Scrape Immowelt ZV listings across all four property types.
+    Each property type = one search page request (~20 listings).
+    """
+    from app.adapters.immowelt import ImmoweltAdapter, PROPERTY_TYPES, ImmoweltDiscoverParams
+    from app.database import AsyncSessionLocal
+
+    adapter = ImmoweltAdapter()
+    total_discovered = 0
+    total_ingested = 0
+    errors = 0
+    source_key = "immowelt_zv"
+
+    for prop_type in PROPERTY_TYPES:
+        params = ImmoweltDiscoverParams(prop_type=prop_type)
+        try:
+            items = await adapter.discover(params)
+            total_discovered += len(items)
+
+            for item in items:
+                try:
+                    detail = await adapter.fetch_detail(item.external_id, item.url, item.hint)
+                    parsed = await adapter.parse(detail)
+
+                    if not parsed.is_auction_listing:
+                        continue
+
+                    async with AsyncSessionLocal() as db:
+                        async with db.begin():
+                            result = await _ingest_parsed_lead(db, source_key, parsed)
+                            if result.get("status") == "ingested":
+                                total_ingested += 1
+
+                except Exception as exc:
+                    logger.error("immowelt.item_error", prop_type=prop_type, error=str(exc))
+                    errors += 1
+
+            logger.info("immowelt.prop_type_done",
+                        prop_type=prop_type,
+                        discovered=len(items),
+                        ingested=total_ingested)
+
+        except Exception as exc:
+            logger.error("immowelt.prop_type_error", prop_type=prop_type, error=str(exc))
+            errors += 1
 
     return {
         "source": source_key,
@@ -385,7 +441,7 @@ async def main(args: argparse.Namespace) -> int:
     if args.source == "insolvency_portal":
         result = await run_insolvency(lookback_hours=args.lookback_hours)
 
-    elif args.source in ("sparkasse_immobilien", "lbs_immobilien"):
+    elif args.source in ("immowelt_zv", "sparkasse_immobilien", "lbs_immobilien"):
         result = await run_bank_portal(args.source, pages=args.pages)
 
     elif args.job_type == "alert" or args.source == "match_alert":
@@ -406,8 +462,8 @@ async def main(args: argparse.Namespace) -> int:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="EarlyEstate single-pass pipeline runner")
     parser.add_argument("--source", default=None,
-                        choices=["insolvency_portal", "sparkasse_immobilien",
-                                 "lbs_immobilien", "match_alert"],
+                        choices=["insolvency_portal", "immowelt_zv",
+                                 "sparkasse_immobilien", "lbs_immobilien", "match_alert"],
                         help="Source to scrape")
     parser.add_argument("--job-type", default=None,
                         choices=["alert", "purge"],

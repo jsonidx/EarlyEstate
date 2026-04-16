@@ -22,17 +22,24 @@ SOURCES = [
         "robots_policy": "ALLOWLIST",
     },
     {
+        "source_key": "immowelt_zv",
+        "source_type": "BANK_PORTAL",
+        "base_url": "https://www.immowelt.de",
+        "enabled": True,
+        "robots_policy": "ALLOWLIST",
+    },
+    {
         "source_key": "sparkasse_immobilien",
         "source_type": "BANK_PORTAL",
         "base_url": "https://www.sparkasse-immobilien.de",
-        "enabled": True,
+        "enabled": False,  # URL unresolvable — placeholder
         "robots_policy": "ALLOWLIST",
     },
     {
         "source_key": "lbs_immobilien",
         "source_type": "BANK_PORTAL",
         "base_url": "https://www.lbs.de",
-        "enabled": True,
+        "enabled": False,  # JS-rendered SPA — placeholder
         "robots_policy": "ALLOWLIST",
     },
     {

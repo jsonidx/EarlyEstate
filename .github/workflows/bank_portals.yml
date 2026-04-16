@@ -2,18 +2,13 @@ name: Bank Portals Screener
 
 on:
   schedule:
-    # Daily at 06:00 UTC — bank portals update slowly
-    - cron: '0 6 * * *'
+    # Daily at 07:00 UTC
+    - cron: '0 7 * * *'
   workflow_dispatch:
-    inputs:
-      pages:
-        description: 'Number of listing pages to scrape per portal'
-        default: '5'
-        required: false
 
 jobs:
-  scrape-sparkasse:
-    name: Scrape Sparkasse Immobilien
+  scrape-immowelt:
+    name: Scrape Immowelt ZV listings
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -28,49 +23,24 @@ jobs:
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
-      - name: Scrape Sparkasse listings
+      - name: Seed sources (idempotent)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m app.jobs.run_once --seed
+
+      - name: Scrape Immowelt ZV listings
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DATABASE_URL_SYNC: ${{ secrets.DATABASE_URL_SYNC }}
           GEOCODING_PROVIDER: nominatim
           NOMINATIM_USER_AGENT: EarlyEstate/0.1-GHA
-        run: |
-          python -m app.jobs.run_once \
-            --source sparkasse_immobilien \
-            --pages ${{ github.event.inputs.pages || '5' }}
-
-  scrape-lbs:
-    name: Scrape LBS Immobilien
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: pip install -e ".[dev]"
-
-      - name: Scrape LBS listings
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          DATABASE_URL_SYNC: ${{ secrets.DATABASE_URL_SYNC }}
-          GEOCODING_PROVIDER: nominatim
-          NOMINATIM_USER_AGENT: EarlyEstate/0.1-GHA
-        run: |
-          python -m app.jobs.run_once \
-            --source lbs_immobilien \
-            --pages ${{ github.event.inputs.pages || '5' }}
+        run: python -m app.jobs.run_once --source immowelt_zv
 
   match-and-alert:
-    name: Match + alert after bank scrape
+    name: Match + alert after scrape
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [scrape-sparkasse, scrape-lbs]
+    needs: [scrape-immowelt]
 
     steps:
       - uses: actions/checkout@v4
