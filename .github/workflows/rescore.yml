@@ -39,4 +39,4 @@ jobs:
           NORTH_DATA_API_KEY: ${{ secrets.NORTH_DATA_API_KEY }}
           GEOCODING_PROVIDER: nominatim
           NOMINATIM_USER_AGENT: EarlyEstate/0.1-GHA
-        run: python -m app.jobs.run_once --source match_alert --wipe-matches
+        run: python -m app.jobs.run_once --source match_alert --wipe-matches --lookback-hours 0
