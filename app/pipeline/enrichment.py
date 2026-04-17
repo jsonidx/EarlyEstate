@@ -35,6 +35,8 @@ class NorthDataCompany:
     register_id: str | None
     register_court: str | None
     address: str | None
+    street: str | None        # street name without house number
+    house_no: str | None      # house/building number
     postal_code: str | None   # 5-digit German PLZ, if returned
     city: str | None
     status: str | None  # active / dissolved / insolvent
@@ -67,9 +69,15 @@ async def enrich_from_north_data(company_name: str) -> NorthDataCompany | None:
             address_parts = company.get("address", {}) or {}
             postal_code = address_parts.get("postalCode") or None
             city = address_parts.get("city") or None
+            street = address_parts.get("street") or None
+            house_no = (
+                address_parts.get("streetNumber")
+                or address_parts.get("houseNumber")
+                or None
+            )
             address_str = ", ".join(
                 filter(None, [
-                    address_parts.get("street"),
+                    f"{street} {house_no}".strip() if street else None,
                     city,
                     postal_code,
                 ])
@@ -80,6 +88,8 @@ async def enrich_from_north_data(company_name: str) -> NorthDataCompany | None:
                 register_id=register.get("id"),
                 register_court=register.get("courtName"),
                 address=address_str or None,
+                street=street,
+                house_no=house_no,
                 postal_code=postal_code,
                 city=city,
                 status=company.get("status"),
@@ -89,6 +99,47 @@ async def enrich_from_north_data(company_name: str) -> NorthDataCompany | None:
         except httpx.HTTPError as exc:
             logger.error("enrichment.north_data.error", name=company_name, error=str(exc))
             return None
+
+
+async def enrich_from_north_data_by_address(
+    street: str, plz: str, city: str
+) -> list[str]:
+    """
+    Reverse lookup: return canonical company names registered at this address.
+    Used to link a newly ingested property listing back to known insolvent parties.
+    Returns an empty list when the API key is absent or the query fails.
+    """
+    if not settings.north_data_api_key:
+        return []
+
+    query = " ".join(filter(None, [street, plz, city]))
+    if not query.strip():
+        return []
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.get(
+                f"{NORTH_DATA_BASE}/company/v1/companies",
+                params={"address": query, "status": "any", "maxResults": 10},
+                headers={"X-Api-Key": settings.north_data_api_key},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            companies = data.get("companies") or []
+            names = [c.get("name") for c in companies if c.get("name")]
+            logger.info(
+                "enrichment.north_data.reverse_lookup",
+                query=query,
+                results=len(names),
+            )
+            return names
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "enrichment.north_data.reverse_lookup.error",
+                query=query,
+                error=str(exc),
+            )
+            return []
 
 
 # ── BORIS / BRW ───────────────────────────────────────────────────────────────

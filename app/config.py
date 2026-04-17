@@ -50,8 +50,7 @@ class Settings(BaseSettings):
     bank_portal_poll_hours: int = 24
 
     # ── Feature flags ─────────────────────────────────────────────────────────
-    # ZVG portal: robots.txt disallows detail endpoints — disabled until legal review
-    zvg_adapter_enabled: bool = False
+    zvg_adapter_enabled: bool = True  # ZVG only scrapes allowed /index.php pages
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
 

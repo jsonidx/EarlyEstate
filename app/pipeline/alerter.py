@@ -255,11 +255,15 @@ def _format_digest_message(alerts: list[Alert]) -> str:
             lines.append(f"  Wert  : €{lead['verkehrswert_eur']:,.0f}")
         if lead.get("auction_date"):
             lines.append(f"  Termin: {lead['auction_date']}")
-        breakdown = (
-            f"name={features.get('name_similarity', 0):.0f} "
-            f"geo={features.get('geo_score', 0):.0f} "
-            f"auction={features.get('auction_signal_score', 0):.0f}"
-        )
+        parts = []
+        for key, label in [
+            ("address_score", "addr"), ("geo_score", "geo"),
+            ("court_jurisdiction_score", "court"), ("timing_score", "timing"),
+            ("register_id_match", "reg"), ("name_similarity", "name"),
+        ]:
+            if features.get(key, 0):
+                parts.append(f"{label}={features[key]:.0f}")
+        breakdown = " ".join(parts) or "n/a"
         lines.append(f"  Score : {breakdown}")
         if lead.get("details_url"):
             lines.append(f"  URL   : {lead['details_url']}")
@@ -358,10 +362,11 @@ def _render_digest_html(alerts: list[Alert]) -> str:
       {f"<b>Verkehrswert:</b> €{lead['verkehrswert_eur']:,.0f}<br>" if lead.get('verkehrswert_eur') else ''}
       {f"<b>Bodenrichtwert:</b> €{brw:,.0f}/m² (BORIS)<br>" if brw else ''}
       {f"<b>ZV-Termin:</b> {lead['auction_date']}<br>" if lead.get('auction_date') else ''}
-      <b>Score:</b> name={features.get('name_similarity',0):.0f}
+      <b>Score:</b> addr={features.get('address_score',0):.0f}
         geo={features.get('geo_score',0):.0f}
-        auction={features.get('auction_signal_score',0):.0f}
-        court={features.get('court_jurisdiction_score',0):.0f}<br>
+        court={features.get('court_jurisdiction_score',0):.0f}
+        timing={features.get('timing_score',0):.0f}
+        reg={features.get('register_id_match',0):.0f}<br>
       {f'<a href="{url}">{url}</a>' if url else '—'}
     </td>
   </tr>""")

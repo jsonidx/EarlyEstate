@@ -54,15 +54,20 @@ def format_alert_text(payload: dict[str, Any]) -> str:
     if lead.get("auction_signal_terms"):
         lines.append(f"Cues: {', '.join(lead['auction_signal_terms'])}")
 
-    breakdown_parts = [
-        f"name={features.get('name_similarity', 0):.0f}",
-        f"geo={features.get('geo_score', 0):.0f}",
-        f"auction={features.get('auction_signal_score', 0):.0f}",
-        f"register={features.get('register_id_match', 0):.0f}",
-    ]
+    breakdown_parts = []
+    if features.get("address_score", 0):
+        breakdown_parts.append(f"addr={features['address_score']:.0f}")
+    if features.get("geo_score", 0):
+        breakdown_parts.append(f"geo={features['geo_score']:.0f}")
     if features.get("court_jurisdiction_score", 0):
         breakdown_parts.append(f"court={features['court_jurisdiction_score']:.0f}")
-    lines += ["", f"Score breakdown: {' '.join(breakdown_parts)}"]
+    if features.get("timing_score", 0):
+        breakdown_parts.append(f"timing={features['timing_score']:.0f}")
+    if features.get("register_id_match", 0):
+        breakdown_parts.append(f"reg={features['register_id_match']:.0f}")
+    if features.get("name_similarity", 0):
+        breakdown_parts.append(f"name={features['name_similarity']:.0f}")
+    lines += ["", f"Score breakdown: {' '.join(breakdown_parts) or 'n/a'}"]
 
     if lead.get("details_url"):
         lines.append(f"URL: {lead['details_url']}")

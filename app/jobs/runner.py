@@ -284,16 +284,21 @@ async def _ingest_insolvency(
                     )
                 if not party_obj.register_court and enriched.register_court:
                     party_obj.register_court = enriched.register_court
-            # Apply PLZ to party address (overrides geocoder-only city entry)
+            # Apply address fields from North Data to party address
             if enriched.postal_code and party_addr is not None:
                 party_addr.postal_code = enriched.postal_code
                 if enriched.city:
                     party_addr.city = enriched.city
+                if enriched.street:
+                    party_addr.street = enriched.street
+                if enriched.house_no:
+                    party_addr.house_no = enriched.house_no
             elif enriched.postal_code:
-                # Address was not created above (e.g. seat_city missing) — create now
                 party_addr = PartyAddress(
                     party_id=uuid.UUID(er_result.party_id),
                     address_raw=enriched.address or enriched.city or "",
+                    street=enriched.street,
+                    house_no=enriched.house_no,
                     city=enriched.city,
                     postal_code=enriched.postal_code,
                     country="DE",
@@ -463,6 +468,10 @@ async def _ingest_asset_lead(
     signal = await evaluate_value_signals(db, lead)
     if signal:
         await send_value_alert(lead, signal)
+
+    # Phase 3 reverse lookup — find insolvent parties registered at this address
+    from app.pipeline.matcher import reverse_match_lead
+    await reverse_match_lead(db, lead)
 
     return {"status": "ingested", "asset_lead_id": str(lead.id)}
 

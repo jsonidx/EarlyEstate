@@ -344,6 +344,18 @@ async def _run_immowelt() -> dict:
     }
 
 
+async def wipe_match_candidates() -> dict:
+    """Delete all match_candidate rows so a rescore starts from a clean slate."""
+    from app.database import AsyncSessionLocal
+    from sqlalchemy import text
+
+    async with AsyncSessionLocal() as db:
+        async with db.begin():
+            result = await db.execute(text("DELETE FROM match_candidate"))
+            deleted = result.rowcount
+    return {"deleted_match_candidates": deleted}
+
+
 async def run_match_and_alert(lookback_hours: int = 0) -> dict:
     """
     Run matching for parties, then send alerts.
@@ -597,6 +609,9 @@ async def main(args: argparse.Namespace) -> int:
         result = await run_bank_portal(args.source, pages=args.pages)
 
     elif args.job_type == "alert" or args.source == "match_alert":
+        if args.wipe_matches:
+            wipe_result = await wipe_match_candidates()
+            logger.info("run_once.wiped_matches", **wipe_result)
         result = await run_match_and_alert(lookback_hours=args.lookback_hours)
 
     elif args.job_type == "digest":
@@ -634,6 +649,8 @@ if __name__ == "__main__":
                         help="How many hours back to scan (insolvency)")
     parser.add_argument("--pages", type=int, default=5,
                         help="How many listing pages to scrape (bank portals)")
+    parser.add_argument("--wipe-matches", action="store_true",
+                        help="Delete all match_candidate rows before rescoring")
 
     args = parser.parse_args()
     sys.exit(asyncio.run(main(args)))
