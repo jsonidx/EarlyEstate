@@ -344,13 +344,18 @@ async def _run_immowelt() -> dict:
     }
 
 
-async def run_match_and_alert() -> dict:
+async def run_match_and_alert(lookback_hours: int = 0) -> dict:
     """
-    Run matching for all parties, then send alerts.
+    Run matching for parties, then send alerts.
+
+    lookback_hours > 0: only match parties created in the last N hours (incremental mode).
+    lookback_hours == 0: match all parties (full rescore).
 
     Each party is committed in its own transaction so partial progress is
     durable if the job is killed by a timeout.
     """
+    from datetime import datetime, timedelta, timezone
+
     from app.database import AsyncSessionLocal
     from app.models.asset_lead import AssetLead
     from app.models.party import Party
@@ -366,8 +371,13 @@ async def run_match_and_alert() -> dict:
     # Leads are loaded once and reused across all parties — eliminates N lead-SELECT queries.
     async with AsyncSessionLocal() as db:
         stmt = select(Party.id)
+        if lookback_hours > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+            stmt = stmt.where(Party.created_at >= cutoff)
         result = await db.execute(stmt)
         party_ids: list[_uuid.UUID] = [row[0] for row in result.fetchall()]
+
+    logger.info("match.scope", lookback_hours=lookback_hours, parties=len(party_ids))
 
     async with AsyncSessionLocal() as db:
         stmt = select(AssetLead)
@@ -405,6 +415,72 @@ async def run_digest() -> dict:
         async with db.begin():
             sent = await send_digest_alerts(db)
     return {"digest_sent": sent}
+
+
+async def run_market_stats() -> dict:
+    """
+    Rebuild plz_market_stats from current asset_lead data.
+
+    Uses PostgreSQL PERCENTILE_CONT for median/p25/p75.
+    Requires sample_size >= 20 per PLZ+type before writing (cold-start guard).
+    Rows with fewer than 5 samples are removed to avoid stale stats after purges.
+    """
+    from app.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        async with db.begin():
+            from sqlalchemy import text
+
+            # Remove stale rows where sample_size dropped too low after purges
+            await db.execute(text("""
+                DELETE FROM plz_market_stats WHERE sample_size < 5
+            """))
+
+            # Rebuild from current asset_lead data
+            await db.execute(text("""
+                INSERT INTO plz_market_stats
+                    (plz, property_type, median_price_per_m2, p25_price_per_m2,
+                     p75_price_per_m2, sample_size, last_updated)
+                SELECT
+                    plz,
+                    CASE object_type
+                        WHEN 'condo'      THEN 'apartment'
+                        WHEN 'house'      THEN 'house'
+                        WHEN 'land'       THEN 'land'
+                        WHEN 'commercial' THEN 'commercial'
+                        ELSE 'other'
+                    END AS property_type,
+                    PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY price_per_m2) AS median,
+                    PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price_per_m2) AS p25,
+                    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price_per_m2) AS p75,
+                    COUNT(*) AS sample_size
+                FROM (
+                    SELECT
+                        postal_code AS plz,
+                        object_type,
+                        asking_price_eur / living_area_m2 AS price_per_m2
+                    FROM asset_lead
+                    WHERE living_area_m2 IS NOT NULL
+                      AND living_area_m2 >= 20
+                      AND asking_price_eur > 10000
+                      AND asking_price_eur / living_area_m2 BETWEEN 200 AND 15000
+                      AND postal_code IS NOT NULL
+                ) sub
+                GROUP BY plz, property_type
+                HAVING COUNT(*) >= 20
+                ON CONFLICT (plz, property_type)
+                DO UPDATE SET
+                    median_price_per_m2 = EXCLUDED.median_price_per_m2,
+                    p25_price_per_m2    = EXCLUDED.p25_price_per_m2,
+                    p75_price_per_m2    = EXCLUDED.p75_price_per_m2,
+                    sample_size         = EXCLUDED.sample_size,
+                    last_updated        = NOW()
+            """))
+
+            result = await db.execute(text("SELECT COUNT(*) FROM plz_market_stats"))
+            total_rows = result.scalar()
+
+    return {"plz_market_stats_rows": total_rows}
 
 
 async def run_purge() -> dict:
@@ -521,10 +597,13 @@ async def main(args: argparse.Namespace) -> int:
         result = await run_bank_portal(args.source, pages=args.pages)
 
     elif args.job_type == "alert" or args.source == "match_alert":
-        result = await run_match_and_alert()
+        result = await run_match_and_alert(lookback_hours=args.lookback_hours)
 
     elif args.job_type == "digest":
         result = await run_digest()
+
+    elif args.job_type == "market_stats":
+        result = await run_market_stats()
 
     elif args.job_type == "purge":
         result = await run_purge()
@@ -545,7 +624,7 @@ if __name__ == "__main__":
                                  "sparkasse_immobilien", "lbs_immobilien", "match_alert"],
                         help="Source to scrape")
     parser.add_argument("--job-type", default=None,
-                        choices=["alert", "digest", "purge"],
+                        choices=["alert", "digest", "purge", "market_stats"],
                         help="Pipeline job type to run")
     parser.add_argument("--migrate", action="store_true",
                         help="Run DB migrations and exit")

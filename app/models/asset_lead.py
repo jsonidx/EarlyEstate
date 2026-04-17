@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Numeric, Text, func, text
+from sqlalchemy import CHAR, DateTime, ForeignKey, Integer, Numeric, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -36,6 +36,7 @@ class AssetLead(Base):
     )
     object_type: Mapped[str | None] = mapped_column(Text, nullable=True)
     # house | condo | land | commercial | other
+    living_area_m2: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
     asking_price_eur: Mapped[float | None] = mapped_column(Numeric, nullable=True)
     verkehrswert_eur: Mapped[float | None] = mapped_column(Numeric, nullable=True)
     auction_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -70,6 +71,23 @@ class CadastralParcel(Base):
     area_m2: Mapped[float | None] = mapped_column(Numeric, nullable=True)
     usage_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PlzMarketStats(Base):
+    """Rolling median price/m² Wohnfläche per PLZ + property type. Updated nightly."""
+
+    __tablename__ = "plz_market_stats"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plz: Mapped[str] = mapped_column(CHAR(5), nullable=False, index=True)
+    property_type: Mapped[str] = mapped_column(Text, nullable=False)
+    median_price_per_m2: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    p25_price_per_m2: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
+    p75_price_per_m2: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
+    sample_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    last_updated: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class Valuation(Base):

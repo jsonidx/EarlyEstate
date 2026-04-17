@@ -203,7 +203,7 @@ async def _handle_parse(job: Job, db: AsyncSession) -> dict[str, Any]:
 
     if source_key == "insolvency_portal":
         return await _ingest_insolvency(db, parsed_data, raw_doc_id)
-    elif source_key in ("sparkasse_immobilien", "lbs_immobilien"):
+    elif source_key in ("sparkasse_immobilien", "lbs_immobilien", "immowelt_zv", "zvg_portal"):
         return await _ingest_asset_lead(db, source_key, parsed_data, raw_doc_id)
 
     return {"status": "skipped", "reason": f"no parser for {source_key}"}
@@ -375,12 +375,16 @@ async def _ingest_asset_lead(
         )
         existing = (await db.execute(dup_stmt)).scalar_one_or_none()
         if existing:
-            # Update fields that may change between scrape runs
+            from app.pipeline.value_screening import parse_wohnflaeche
+            search_text = " ".join(filter(None, [
+                data.get("title"), data.get("object_description"), data.get("address_raw"),
+            ]))
             existing.title = data.get("title") or existing.title
             existing.asking_price_eur = data.get("asking_price_eur") or existing.asking_price_eur
             existing.verkehrswert_eur = data.get("verkehrswert_eur") or existing.verkehrswert_eur
             existing.auction_date = _parse_iso(data.get("auction_date")) or existing.auction_date
             existing.auction_signal_terms = cues
+            existing.living_area_m2 = parse_wohnflaeche(search_text) or existing.living_area_m2
             existing.payload = data
             await db.flush()
             return {"status": "updated", "asset_lead_id": str(existing.id)}
@@ -396,6 +400,13 @@ async def _ingest_asset_lead(
         if geo:
             geom_wkt = result_to_wkt(geo)
 
+    from app.pipeline.value_screening import parse_wohnflaeche
+    search_text = " ".join(filter(None, [
+        data.get("title"), data.get("object_description"),
+        data.get("address_raw"),
+    ]))
+    living_area_m2 = parse_wohnflaeche(search_text)
+
     lead = AssetLead(
         source_id=src.id,
         listing_id=listing_id,
@@ -405,6 +416,7 @@ async def _ingest_asset_lead(
         city=city,
         geom=geom_wkt,
         object_type=data.get("object_type"),
+        living_area_m2=living_area_m2,
         asking_price_eur=data.get("asking_price_eur"),
         verkehrswert_eur=data.get("verkehrswert_eur"),
         auction_date=_parse_iso(data.get("auction_date")),
@@ -445,6 +457,12 @@ async def _ingest_asset_lead(
                     state=state_code,
                     brw_eur_m2=brw.value_eur_per_m2,
                 )
+
+    # Value screening — check if this listing is below market price
+    from app.pipeline.value_screening import evaluate_value_signals, send_value_alert
+    signal = await evaluate_value_signals(db, lead)
+    if signal:
+        await send_value_alert(lead, signal)
 
     return {"status": "ingested", "asset_lead_id": str(lead.id)}
 
@@ -548,6 +566,17 @@ def _build_discover_params(source_key: str, payload: dict) -> Any:
         return LBSDiscoverParams(
             region=payload.get("region"),
             page=payload.get("page", 1),
+        )
+    elif source_key == "immowelt_zv":
+        from app.adapters.immowelt import ImmoweltDiscoverParams
+        return ImmoweltDiscoverParams(prop_type=payload.get("prop_type", "haeuser"))
+    elif source_key == "zvg_portal":
+        from app.adapters.zvg import ZVGDiscoverParams
+        from datetime import date
+        return ZVGDiscoverParams(
+            state=payload.get("state", "Bayern"),
+            date_from=date.fromisoformat(payload["date_from"]) if payload.get("date_from") else None,
+            date_to=date.fromisoformat(payload["date_to"]) if payload.get("date_to") else None,
         )
     raise ValueError(f"No discover params builder for {source_key}")
 

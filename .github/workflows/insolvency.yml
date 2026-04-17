@@ -76,4 +76,6 @@ jobs:
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
           GEOCODING_PROVIDER: nominatim
           NOMINATIM_USER_AGENT: EarlyEstate/0.1-GHA
-        run: python -m app.jobs.run_once --source match_alert
+        run: |
+          python -m app.jobs.run_once --source match_alert \
+            --lookback-hours ${{ github.event.inputs.lookback_hours || '2' }}

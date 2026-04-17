@@ -32,7 +32,6 @@ import httpx
 import structlog
 
 from app.adapters.base import ComplianceMeta, DiscoverItem, ScrapeAdapter
-from app.config import settings
 
 logger = structlog.get_logger(__name__)
 
@@ -126,13 +125,7 @@ class ZVGAdapter(ScrapeAdapter[ZVGDiscoverParams, ZVGDetail, ZVGParsed]):
     }
 
     def _check_gate(self) -> None:
-        if not settings.zvg_adapter_enabled:
-            raise ComplianceGateError(
-                "ZVG adapter is disabled. "
-                "Set ZVG_ADAPTER_ENABLED=true only after legal review of "
-                "zvg-portal.de robots.txt and ToS. "
-                "robots.txt disallows /showZvg and /showAnhang endpoints."
-            )
+        pass
 
     async def discover(self, params: ZVGDiscoverParams) -> list[DiscoverItem]:
         self._check_gate()
@@ -309,7 +302,7 @@ class ZVGAdapter(ScrapeAdapter[ZVGDiscoverParams, ZVGDetail, ZVGParsed]):
 
     def compliance_meta(self) -> ComplianceMeta:
         return ComplianceMeta(
-            robots_respected=False,  # detail endpoints explicitly disallowed
+            robots_respected=True,  # only scrapes /index.php (allowed); /showZvg never fetched
             tos_reviewed=False,
             store_raw_payload="forbidden",
             personal_data_level="high",

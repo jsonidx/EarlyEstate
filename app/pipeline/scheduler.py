@@ -69,7 +69,9 @@ async def _enqueue_insolvency_jobs() -> None:
 
 
 async def _enqueue_bank_portal_jobs() -> None:
-    """Enqueue daily discover jobs for Sparkasse and LBS."""
+    """Enqueue daily discover jobs for Sparkasse, LBS, Immowelt, and (optionally) ZVG."""
+    from app.adapters.immowelt import PROPERTY_TYPES
+
     async with AsyncSessionLocal() as db:
         for source_key in ["sparkasse_immobilien", "lbs_immobilien"]:
             await enqueue_job(
@@ -78,6 +80,25 @@ async def _enqueue_bank_portal_jobs() -> None:
                 source_key=source_key,
                 payload={"page": 1},
             )
+
+        for prop_type in PROPERTY_TYPES:
+            await enqueue_job(
+                db,
+                job_type="DISCOVER",
+                source_key="immowelt_zv",
+                payload={"prop_type": prop_type},
+            )
+
+        if settings.zvg_adapter_enabled:
+            from app.adapters.zvg import ZVGAdapter
+            for state in ZVGAdapter._STATE_PARAMS:  # noqa: SLF001
+                await enqueue_job(
+                    db,
+                    job_type="DISCOVER",
+                    source_key="zvg_portal",
+                    payload={"state": state},
+                )
+
         await db.commit()
     logger.info("scheduler.bank_portal_jobs_enqueued")
 
