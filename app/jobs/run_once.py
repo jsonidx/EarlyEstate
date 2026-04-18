@@ -249,6 +249,13 @@ async def run_bank_portal(source_key: str, pages: int = 5) -> dict:
             if source_key == "sparkasse_immobilien":
                 from app.adapters.sparkasse import SparkasseDiscoverParams
                 params = SparkasseDiscoverParams(page=page)
+            elif source_key == "zvg_portal":
+                from app.adapters.zvg import ZVGAdapter, ZVGDiscoverParams
+                # Iterate all states across pages; page index maps to state list
+                states = list(ZVGAdapter._STATE_PARAMS.keys())  # noqa: SLF001
+                if page > len(states):
+                    break
+                params = ZVGDiscoverParams(state=states[page - 1])
             else:
                 from app.adapters.lbs import LBSDiscoverParams
                 params = LBSDiscoverParams(page=page)

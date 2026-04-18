@@ -63,7 +63,7 @@ jobs:
           DATABASE_URL_SYNC: ${{ secrets.DATABASE_URL_SYNC }}
           GEOCODING_PROVIDER: nominatim
           NOMINATIM_USER_AGENT: EarlyEstate/0.1-GHA
-        run: python -m app.jobs.run_once --source zvg_portal --pages 10
+        run: python -m app.jobs.run_once --source zvg_portal --pages 16
 
   scrape-sparkasse:
     name: Scrape Sparkasse + LBS listings
