@@ -357,7 +357,7 @@ async def run_matching_for_party(
         existing = existing_by_lead.get(lead.id)
         if existing:
             existing.score_total = breakdown.total
-            existing.score_breakdown = _breakdown_to_dict(breakdown)
+            existing.score_breakdown = breakdown_to_dict(breakdown)
             existing.updated_at = now
             candidates.append(existing)
         else:
@@ -365,7 +365,7 @@ async def run_matching_for_party(
                 party_id=party_id,
                 asset_lead_id=lead.id,
                 score_total=breakdown.total,
-                score_breakdown=_breakdown_to_dict(breakdown),
+                score_breakdown=breakdown_to_dict(breakdown),
             )
             db.add(mc)
             candidates.append(mc)
@@ -452,7 +452,7 @@ def build_dedup_key(
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def _breakdown_to_dict(b: ScoreBreakdown) -> dict[str, Any]:
+def breakdown_to_dict(b: ScoreBreakdown) -> dict[str, Any]:
     return {
         "address_score": b.address_score,
         "geo_score": b.geo_score,

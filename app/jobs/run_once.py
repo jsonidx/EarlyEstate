@@ -360,11 +360,8 @@ async def run_match_and_alert(lookback_hours: int = 0) -> dict:
     """
     Run matching for parties, then send alerts.
 
-    lookback_hours > 0: only match parties created in the last N hours (incremental mode).
-    lookback_hours == 0: match all parties (full rescore).
-
-    Each party is committed in its own transaction so partial progress is
-    durable if the job is killed by a timeout.
+    lookback_hours > 0 (incremental): per-party sessions, only recent parties.
+    lookback_hours == 0 (full rescore): bulk mode — 4 queries total, in-memory scoring.
     """
     from datetime import datetime, timedelta, timezone
 
@@ -372,34 +369,48 @@ async def run_match_and_alert(lookback_hours: int = 0) -> dict:
     from app.models.asset_lead import AssetLead
     from app.models.party import Party
     from app.pipeline.alerter import process_pending_alerts
-    from app.pipeline.matcher import run_matching_for_party
     from sqlalchemy import select
-    import uuid as _uuid
 
-    candidates_total = 0
     alerts_sent = 0
-
-    # Load party IDs and all asset leads in short-lived sessions.
-    # Leads are loaded once and reused across all parties — eliminates N lead-SELECT queries.
-    async with AsyncSessionLocal() as db:
-        stmt = select(Party.id)
-        if lookback_hours > 0:
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-            stmt = stmt.where(Party.created_at >= cutoff)
-        result = await db.execute(stmt)
-        party_ids: list[_uuid.UUID] = [row[0] for row in result.fetchall()]
-
-    logger.info("match.scope", lookback_hours=lookback_hours, parties=len(party_ids))
 
     async with AsyncSessionLocal() as db:
         stmt = select(AssetLead)
         result = await db.execute(stmt)
         all_leads = list(result.scalars().all())
-    # Objects are now detached (session closed) but attribute-loaded — safe for read-only scoring
 
-    logger.info("match.loaded", parties=len(party_ids), leads=len(all_leads))
+    if lookback_hours > 0:
+        candidates_total = await _run_incremental_match(all_leads, lookback_hours)
+    else:
+        candidates_total = await _run_bulk_match(all_leads)
 
-    # Match each party in its own committed transaction
+    async with AsyncSessionLocal() as db:
+        async with db.begin():
+            alerts_sent = await process_pending_alerts(db)
+
+    return {"candidates": candidates_total, "alerts_sent": alerts_sent}
+
+
+async def _run_incremental_match(all_leads, lookback_hours: int) -> int:
+    """Per-party sessions for incremental runs (small number of new parties)."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.database import AsyncSessionLocal
+    from app.models.party import Party
+    from app.pipeline.matcher import run_matching_for_party
+    from sqlalchemy import select
+    import uuid as _uuid
+
+    async with AsyncSessionLocal() as db:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+        result = await db.execute(
+            select(Party.id).where(Party.created_at >= cutoff)
+        )
+        party_ids: list[_uuid.UUID] = [row[0] for row in result.fetchall()]
+
+    logger.info("match.scope", lookback_hours=lookback_hours, parties=len(party_ids),
+                leads=len(all_leads))
+
+    candidates_total = 0
     for party_id in party_ids:
         try:
             async with AsyncSessionLocal() as db:
@@ -411,11 +422,94 @@ async def run_match_and_alert(lookback_hours: int = 0) -> dict:
         except Exception as exc:
             logger.error("match.party_error", party_id=str(party_id), error=str(exc))
 
-    async with AsyncSessionLocal() as db:
-        async with db.begin():
-            alerts_sent = await process_pending_alerts(db)
+    return candidates_total
 
-    return {"candidates": candidates_total, "alerts_sent": alerts_sent}
+
+async def _run_bulk_match(all_leads) -> int:
+    """
+    Full rescore in bulk — 4 DB queries total, all scoring in memory.
+
+    Instead of 4 queries × N parties (36K+ round-trips for 9K parties),
+    loads all parties, addresses, and events in one query each, then scores
+    all party×lead combinations in-process and bulk-inserts results.
+    """
+    from datetime import datetime, timezone
+
+    from app.database import AsyncSessionLocal
+    from app.models.event import Event
+    from app.models.match_candidate import MatchCandidate
+    from app.models.party import Party, PartyAddress
+    from app.pipeline.matcher import LOW_THRESHOLD, score_match, breakdown_to_dict as _breakdown_to_dict
+    from sqlalchemy import select, text
+
+    async with AsyncSessionLocal() as db:
+        # 1. All parties
+        parties = {
+            p.id: p for p in (await db.execute(select(Party))).scalars().all()
+        }
+        # 2. First address per party
+        addresses: dict = {}
+        for pa in (await db.execute(select(PartyAddress))).scalars().all():
+            if pa.party_id not in addresses:
+                addresses[pa.party_id] = pa
+        # 3. Latest insolvency event per party
+        events: dict = {}
+        for ev in (await db.execute(
+            select(Event).where(Event.event_type == "INSOLVENCY_PUBLICATION")
+        )).scalars().all():
+            existing = events.get(ev.party_id)
+            if existing is None or (ev.event_time and (
+                existing.event_time is None or ev.event_time > existing.event_time
+            )):
+                events[ev.party_id] = ev
+
+    logger.info(
+        "match.scope", lookback_hours=0,
+        parties=len(parties), leads=len(all_leads), events=len(events),
+    )
+
+    # Score all pairs in memory
+    rows = []
+    now = datetime.now(timezone.utc)
+    for party in parties.values():
+        pa = addresses.get(party.id)
+        ev = events.get(party.id)
+        court = ev.payload.get("court") if ev else None
+        ins_date = ev.event_time if ev else None
+
+        for lead in all_leads:
+            bd = score_match(party, lead, pa,
+                             insolvency_court=court, insolvency_date=ins_date)
+            if bd.total >= LOW_THRESHOLD:
+                rows.append({
+                    "party_id": str(party.id),
+                    "asset_lead_id": str(lead.id),
+                    "score_total": bd.total,
+                    "score_breakdown": _breakdown_to_dict(bd),
+                })
+
+    logger.info("match.scored", above_threshold=len(rows))
+
+    if not rows:
+        return 0
+
+    # Bulk insert in batches of 500
+    BATCH = 500
+    async with AsyncSessionLocal() as db:
+        for i in range(0, len(rows), BATCH):
+            chunk = rows[i:i + BATCH]
+            async with db.begin():
+                db.add_all([
+                    MatchCandidate(
+                        party_id=r["party_id"],
+                        asset_lead_id=r["asset_lead_id"],
+                        score_total=r["score_total"],
+                        score_breakdown=r["score_breakdown"],
+                    )
+                    for r in chunk
+                ])
+
+    return len(rows)
 
 
 async def run_digest() -> dict:
