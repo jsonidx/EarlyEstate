@@ -43,7 +43,7 @@ _STATE_PARAMS: dict[str, str] = {
     "Baden-Württemberg":       "bw",
     "Bayern":                  "by",
     "Berlin":                  "be",
-    "Brandenburg":             "bb",
+    "Brandenburg":             "br",
     "Bremen":                  "hb",
     "Hamburg":                 "hh",
     "Hessen":                  "he",
@@ -135,25 +135,37 @@ class ZVGAdapter(ScrapeAdapter[ZVGDiscoverParams, ZVGDetail, ZVGParsed]):
             logger.warning("zvg.unknown_state", state=params.state)
             return []
 
-        query_params: dict[str, str] = {
-            "land": state_param,
-            "order_col": "AKTENZEICHEN",
-            "order_dir": "0",
+        post_data: dict[str, str] = {
+            "land_abk": state_param,
+            "order_by": "3",        # 3 = Aktenzeichen
+            "ger_id": "0",
+            "ger_name": "",
+            "az1": "", "az2": "", "az3": "", "az4": "",
+            "art": "",
+            "obj": "",
+            "ort": params.city or "",
+            "von_datum": params.date_from.strftime("%d.%m.%Y") if params.date_from else "",
+            "bis_datum": params.date_to.strftime("%d.%m.%Y") if params.date_to else "",
         }
-        if params.date_from:
-            query_params["von_datum"] = params.date_from.strftime("%d.%m.%Y")
-        if params.date_to:
-            query_params["bis_datum"] = params.date_to.strftime("%d.%m.%Y")
-        if params.city:
-            query_params["ort"] = params.city
 
         try:
             async with httpx.AsyncClient(
                 headers=self._HEADERS, timeout=30.0, follow_redirects=True
             ) as client:
-                resp = await client.get(ZVG_BASE + ZVG_SEARCH, params=query_params)
+                # First page
+                resp = await client.post(ZVG_BASE + ZVG_SEARCH, data=post_data)
                 resp.raise_for_status()
                 items = self._parse_results_page(resp.text, params.state)
+
+                # Fetch all remaining pages if portal indicates more
+                total_m = re.search(r"Insgesamt\s+(\d+)", resp.text)
+                if total_m and len(items) < int(total_m.group(1)):
+                    all_resp = await client.post(
+                        ZVG_BASE + ZVG_SEARCH + "&all=1", data=post_data
+                    )
+                    if all_resp.status_code == 200:
+                        items = self._parse_results_page(all_resp.text, params.state)
+
                 logger.info("zvg.discover", state=params.state, count=len(items))
                 return items
         except httpx.HTTPError as exc:
@@ -164,33 +176,38 @@ class ZVGAdapter(ScrapeAdapter[ZVGDiscoverParams, ZVGDetail, ZVGParsed]):
         """
         Extract listing stubs from ZVG search results page.
 
-        Result table rows contain: Aktenzeichen, Gericht, Objekt, Ort, Termin, Verkehrswert.
-        Each row links to /showZvg?...zvgId=NNN (stored as details_url, NOT fetched).
+        The portal renders each listing as a block of <TR> rows inside a single
+        <table border=0>. Each block starts with an Aktenzeichen row containing:
+          href=index.php?button=showZvg&zvg_id=NNN&land_abk=XX
+        Subsequent rows carry Objekt/Lage, Verkehrswert, Termin.
         """
         items: list[DiscoverItem] = []
         seen: set[str] = set()
 
-        # Match table rows with ZVG listing links
-        row_re = re.compile(
-            r'<tr[^>]*>.*?'
-            r'href="(/showZvg[^"]+zvgId=(\d+)[^"]*)"[^>]*>.*?'
-            r'</tr>',
-            re.DOTALL | re.IGNORECASE,
+        # Split HTML into per-listing blocks on the Aktenzeichen anchor
+        block_re = re.compile(
+            r'href=index\.php\?button=showZvg&zvg_id=(\d+)&land_abk=\w+',
+            re.IGNORECASE,
         )
 
-        for m in row_re.finditer(html):
-            detail_path = m.group(1)
-            zvg_id = m.group(2)
+        # Find all zvg_ids and their positions
+        for m in block_re.finditer(html):
+            zvg_id = m.group(1)
             if zvg_id in seen:
                 continue
             seen.add(zvg_id)
 
-            row_html = m.group(0)
-            hint = self._parse_row_hint(row_html, zvg_id, state, detail_path)
+            # Grab the block from this match up to the next HR separator
+            block_start = max(0, m.start() - 200)
+            hr_idx = html.find('<hr>', m.end())
+            block_end = hr_idx if hr_idx > 0 else m.end() + 1500
+            block_html = html[block_start:block_end]
 
+            detail_path = f"/index.php?button=showZvg&zvg_id={zvg_id}&land_abk={_STATE_PARAMS.get(state, '')}"
+            hint = self._parse_row_hint(block_html, zvg_id, state, detail_path)
             items.append(DiscoverItem(
                 external_id=f"zvg_{zvg_id}",
-                url=ZVG_BASE + "/index.php",  # No direct result links per portal rules
+                url=ZVG_BASE + "/index.php",
                 hint=hint,
             ))
 
@@ -203,26 +220,38 @@ class ZVGAdapter(ScrapeAdapter[ZVGDiscoverParams, ZVGDetail, ZVGParsed]):
         state: str,
         detail_path: str,
     ) -> dict[str, Any]:
-        """Extract structured fields from a result table row."""
-        # Strip tags for text extraction
-        text = re.sub(r"<[^>]+>", " ", row_html)
+        """Extract structured fields from a ZVG listing block."""
+        # Decode HTML entities, then strip tags
+        text = row_html.replace("&#128;", "€").replace("&nbsp;", " ")
+        text = re.sub(r"<[^>]+>", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
 
-        # Court — "Amtsgericht XYZ"
+        # Court — "Amtsgericht XYZ" or "in Berlin"
         court = None
-        court_m = re.search(r"Amtsgericht\s+(\S+)", text, re.I)
+        court_m = re.search(r"Amtsgericht\s+(in\s+)?(\S+)", text, re.I)
         if court_m:
-            court = f"Amtsgericht {court_m.group(1)}"
+            city_part = court_m.group(2)
+            court = f"Amtsgericht {city_part}"
 
-        # Auction date — "TT.MM.YYYY"
+        # Auction date — German long format: "Donnerstag, 23. April 2026"
+        _MONTHS = {"januar":1,"februar":2,"märz":3,"april":4,"mai":5,"juni":6,
+                   "juli":7,"august":8,"september":9,"oktober":10,"november":11,"dezember":12}
         auction_date = None
-        date_m = re.search(r"\b(\d{2}\.\d{2}\.\d{4})\b", text)
+        date_m = re.search(
+            r"\b(\d{1,2})\.\s*([A-Za-zä]+)\s+(\d{4})\b", text, re.I
+        )
         if date_m:
-            auction_date = date_m.group(1)
+            try:
+                day, month_str, year = date_m.group(1), date_m.group(2).lower(), date_m.group(3)
+                month = _MONTHS.get(month_str)
+                if month:
+                    auction_date = f"{int(day):02d}.{month:02d}.{year}"
+            except (ValueError, AttributeError):
+                pass
 
-        # Verkehrswert
+        # Verkehrswert — number before or after €/&#128;
         verkehrswert_eur = None
-        vkw_m = re.search(r"([\d.,]+)\s*€", text)
+        vkw_m = re.search(r"Verkehrswert[^0-9€]*([0-9][0-9.,]+)", text, re.I)
         if vkw_m:
             try:
                 verkehrswert_eur = float(
@@ -247,7 +276,6 @@ class ZVGAdapter(ScrapeAdapter[ZVGDiscoverParams, ZVGDetail, ZVGParsed]):
             "postal_code": postal_code,
             "auction_date": auction_date,
             "verkehrswert_eur": verkehrswert_eur,
-            # Deep link — human review only, not auto-fetched
             "details_url": ZVG_BASE + detail_path,
             "auction_signal_terms": ["zwangsversteigerung", "zvg"],
         }
