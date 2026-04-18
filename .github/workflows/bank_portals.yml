@@ -39,7 +39,7 @@ jobs:
   scrape-zvg:
     name: Scrape ZVG portal listings
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
