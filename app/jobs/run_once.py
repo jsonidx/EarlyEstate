@@ -559,7 +559,8 @@ async def run_market_stats() -> dict:
                     PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY price_per_m2) AS median,
                     PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY price_per_m2) AS p25,
                     PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY price_per_m2) AS p75,
-                    COUNT(*) AS sample_size
+                    COUNT(*) AS sample_size,
+                    NOW() AS last_updated
                 FROM (
                     SELECT
                         postal_code AS plz,
