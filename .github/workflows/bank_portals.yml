@@ -36,11 +36,77 @@ jobs:
           NOMINATIM_USER_AGENT: EarlyEstate/0.1-GHA
         run: python -m app.jobs.run_once --source immowelt_zv
 
+  scrape-zvg:
+    name: Scrape ZVG portal listings
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Seed sources (idempotent)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m app.jobs.run_once --seed
+
+      - name: Scrape ZVG portal
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_URL_SYNC: ${{ secrets.DATABASE_URL_SYNC }}
+          GEOCODING_PROVIDER: nominatim
+          NOMINATIM_USER_AGENT: EarlyEstate/0.1-GHA
+        run: python -m app.jobs.run_once --source zvg_portal --pages 10
+
+  scrape-sparkasse:
+    name: Scrape Sparkasse + LBS listings
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Seed sources (idempotent)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m app.jobs.run_once --seed
+
+      - name: Scrape Sparkasse Immobilien
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_URL_SYNC: ${{ secrets.DATABASE_URL_SYNC }}
+          GEOCODING_PROVIDER: nominatim
+          NOMINATIM_USER_AGENT: EarlyEstate/0.1-GHA
+        run: python -m app.jobs.run_once --source sparkasse_immobilien
+
+      - name: Scrape LBS Immobilien
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DATABASE_URL_SYNC: ${{ secrets.DATABASE_URL_SYNC }}
+          GEOCODING_PROVIDER: nominatim
+          NOMINATIM_USER_AGENT: EarlyEstate/0.1-GHA
+        run: python -m app.jobs.run_once --source lbs_immobilien
+
   match-and-alert:
     name: Match + alert after scrape
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [scrape-immowelt]
+    needs: [scrape-immowelt, scrape-zvg, scrape-sparkasse]
 
     steps:
       - uses: actions/checkout@v4
