@@ -250,9 +250,8 @@ async def run_bank_portal(source_key: str, pages: int = 5) -> dict:
                 from app.adapters.sparkasse import SparkasseDiscoverParams
                 params = SparkasseDiscoverParams(page=page)
             elif source_key == "zvg_portal":
-                from app.adapters.zvg import ZVGAdapter, ZVGDiscoverParams
-                # Iterate all states across pages; page index maps to state list
-                states = list(ZVGAdapter._STATE_PARAMS.keys())  # noqa: SLF001
+                from app.adapters.zvg import ZVGDiscoverParams, _STATE_PARAMS as ZVG_STATES
+                states = list(ZVG_STATES.keys())
                 if page > len(states):
                     break
                 params = ZVGDiscoverParams(state=states[page - 1])
