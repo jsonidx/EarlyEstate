@@ -1,0 +1,38 @@
+name: Seed Market Stats
+
+on:
+  workflow_dispatch:
+    inputs:
+      pages_per_type:
+        description: 'Immowelt pages to scrape per property type (house/apartment/land)'
+        default: '20'
+        required: false
+
+# One-shot bootstrap: scrapes regular Immowelt Kauf listings to populate
+# plz_market_stats with market medians before the self-populating pipeline
+# has enough asset_lead rows per PLZ.
+
+jobs:
+  seed:
+    name: Seed PLZ market stats from Immowelt
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Seed market stats
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python -m app.jobs.run_once \
+            --job-type seed_market_stats \
+            --pages ${{ github.event.inputs.pages_per_type || '20' }}

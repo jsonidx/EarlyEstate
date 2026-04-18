@@ -590,6 +590,41 @@ async def run_market_stats() -> dict:
     return {"plz_market_stats_rows": total_rows}
 
 
+async def run_seed_market_stats(pages_per_type: int = 20) -> dict:
+    """
+    Seed plz_market_stats by scraping regular Immowelt Kauf listings.
+
+    Runs once to bootstrap PLZ medians before the self-populating pipeline
+    has accumulated enough asset_lead rows per PLZ.
+    """
+    from app.database import AsyncSessionLocal
+    from app.pipeline.market_seed import aggregate_to_stats, scrape_market_listings
+    from sqlalchemy import text
+
+    listings = await scrape_market_listings(pages_per_type=pages_per_type)
+    rows = aggregate_to_stats(listings)
+    logger.info("market_seed.aggregated", listings=len(listings), plz_rows=len(rows))
+
+    async with AsyncSessionLocal() as db:
+        async with db.begin():
+            for row in rows:
+                await db.execute(text("""
+                    INSERT INTO plz_market_stats
+                        (plz, property_type, median_price_per_m2, p25_price_per_m2,
+                         p75_price_per_m2, sample_size, last_updated)
+                    VALUES (:plz, :property_type, :median, :p25, :p75, :sample_size, NOW())
+                    ON CONFLICT (plz, property_type)
+                    DO UPDATE SET
+                        median_price_per_m2 = EXCLUDED.median_price_per_m2,
+                        p25_price_per_m2    = EXCLUDED.p25_price_per_m2,
+                        p75_price_per_m2    = EXCLUDED.p75_price_per_m2,
+                        sample_size         = EXCLUDED.sample_size,
+                        last_updated        = NOW()
+                """), row)
+
+    return {"listings_scraped": len(listings), "plz_rows_upserted": len(rows)}
+
+
 async def run_purge() -> dict:
     from app.database import AsyncSessionLocal
     from app.pipeline.auditor import expire_stale_matches, run_retention_purge
@@ -715,6 +750,9 @@ async def main(args: argparse.Namespace) -> int:
     elif args.job_type == "market_stats":
         result = await run_market_stats()
 
+    elif args.job_type == "seed_market_stats":
+        result = await run_seed_market_stats(pages_per_type=args.pages)
+
     elif args.job_type == "purge":
         result = await run_purge()
 
@@ -734,7 +772,7 @@ if __name__ == "__main__":
                                  "sparkasse_immobilien", "lbs_immobilien", "match_alert"],
                         help="Source to scrape")
     parser.add_argument("--job-type", default=None,
-                        choices=["alert", "digest", "purge", "market_stats"],
+                        choices=["alert", "digest", "purge", "market_stats", "seed_market_stats"],
                         help="Pipeline job type to run")
     parser.add_argument("--migrate", action="store_true",
                         help="Run DB migrations and exit")
