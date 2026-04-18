@@ -735,7 +735,7 @@ async def main(args: argparse.Namespace) -> int:
     if args.source == "insolvency_portal":
         result = await run_insolvency(lookback_hours=args.lookback_hours)
 
-    elif args.source in ("immowelt_zv", "sparkasse_immobilien", "lbs_immobilien"):
+    elif args.source in ("immowelt_zv", "sparkasse_immobilien", "lbs_immobilien", "zvg_portal"):
         result = await run_bank_portal(args.source, pages=args.pages)
 
     elif args.job_type == "alert" or args.source == "match_alert":
@@ -769,7 +769,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="EarlyEstate single-pass pipeline runner")
     parser.add_argument("--source", default=None,
                         choices=["insolvency_portal", "immowelt_zv",
-                                 "sparkasse_immobilien", "lbs_immobilien", "match_alert"],
+                                 "sparkasse_immobilien", "lbs_immobilien", "zvg_portal", "match_alert"],
                         help="Source to scrape")
     parser.add_argument("--job-type", default=None,
                         choices=["alert", "digest", "purge", "market_stats", "seed_market_stats"],
