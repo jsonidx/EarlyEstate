@@ -260,7 +260,8 @@ async def run_bank_portal(source_key: str, pages: int = 5) -> dict:
                 params = LBSDiscoverParams(page=page)
 
             items = await adapter.discover(params)
-            if not items:
+            # For ZVG, empty state is normal (court may have no current auctions) — keep going
+            if not items and source_key != "zvg_portal":
                 break
             total_discovered += len(items)
 
